@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>自动对账系统</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1><span class="icon-badge">◎</span> 自动对账系统</h1>
+            <p>上传供应商对账单和系统入库单，自动完成数据匹配与差异分析</p>
+            <div class="theme-switcher">
+                <label for="theme-select">主题</label>
+                <select id="theme-select">
+                    <option value="sage">鼠尾草绿</option>
+                    <option value="purple">淡雅紫</option>
+                    <option value="mist">雾蓝灰</option>
+                    <option value="sand">暖米杏</option>
+                </select>
+            </div>
+        </header>
+
+        <main>
+            <!-- 文件上传区域 -->
+            <section class="upload-section">
+                <h2><span class="section-icon">◧</span> 文件上传</h2>
+                <div class="upload-grid">
+                    <div class="upload-card" id="vendor-upload">
+                        <h3>供应商对账单</h3>
+                        <div class="upload-area" onclick="document.getElementById('vendor-file').click()">
+                            <div class="upload-icon">▣</div>
+                            <p>点击或拖拽上传Excel文件</p>
+                            <span class="file-types">支持 .xlsx, .xls</span>
+                        </div>
+                        <input type="file" id="vendor-file" accept=".xlsx,.xls" style="display: none;">
+                        <div class="file-info" id="vendor-info"></div>
+                        <div class="preview-table" id="vendor-preview"></div>
+                    </div>
+
+                    <div class="upload-card" id="internal-upload">
+                        <h3>系统入库单</h3>
+                        <div class="upload-area" onclick="document.getElementById('internal-file').click()">
+                            <div class="upload-icon">◫</div>
+                            <p>点击或拖拽上传Excel文件</p>
+                            <span class="file-types">支持 .xlsx, .xls</span>
+                        </div>
+                        <input type="file" id="internal-file" accept=".xlsx,.xls" style="display: none;">
+                        <div class="file-info" id="internal-info"></div>
+                        <div class="preview-table" id="internal-preview"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 配置区域 -->
+            <section class="config-section">
+                <h2><span class="section-icon">◇</span> 对账配置</h2>
+                <div class="config-grid">
+                    <div class="config-card">
+                        <h3>容差设置</h3>
+                        <div class="form-group">
+                            <label>价格容差</label>
+                            <input type="number" id="price-tolerance" value="0.0001" step="0.0001">
+                            <small>单价差异在此范围内视为匹配</small>
+                        </div>
+                        <div class="form-group">
+                            <label>数量容差</label>
+                            <input type="number" id="qty-tolerance" value="0" step="1">
+                            <small>数量差异在此范围内视为匹配</small>
+                        </div>
+                        <div class="form-group">
+                            <label>金额容差</label>
+                            <input type="number" id="amount-tolerance" value="0.01" step="0.01">
+                            <small>金额差异在此范围内视为匹配</small>
+                        </div>
+                    </div>
+
+                    <div class="config-card">
+                        <h3>供应商列映射</h3>
+                        <div class="form-group">
+                            <label>PO号</label>
+                            <input type="text" id="vendor-po" value="订单号码">
+                        </div>
+                        <div class="form-group">
+                            <label>物料编码</label>
+                            <input type="text" id="vendor-item-code" value="物料编码">
+                        </div>
+                        <div class="form-group">
+                            <label>数量</label>
+                            <input type="text" id="vendor-qty" value="数量">
+                        </div>
+                        <div class="form-group">
+                            <label>单价</label>
+                            <input type="text" id="vendor-price" value="单价">
+                        </div>
+                        <div class="form-group">
+                            <label>金额</label>
+                            <input type="text" id="vendor-amount" value="金额">
+                        </div>
+                    </div>
+
+                    <div class="config-card">
+                        <h3>入库单列映射</h3>
+                        <div class="form-group">
+                            <label>PO号</label>
+                            <input type="text" id="internal-po" value="订单单号">
+                        </div>
+                        <div class="form-group">
+                            <label>物料编码</label>
+                            <input type="text" id="internal-item-code" value="物料编码">
+                        </div>
+                        <div class="form-group">
+                            <label>数量</label>
+                            <input type="text" id="internal-qty" value="实收数量">
+                        </div>
+                        <div class="form-group">
+                            <label>单价</label>
+                            <input type="text" id="internal-price" value="含税单价">
+                        </div>
+                        <div class="form-group">
+                            <label>金额</label>
+                            <input type="text" id="internal-amount" value="价税合计">
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 操作按钮 -->
+            <section class="action-section">
+                <button id="reconcile-btn" class="btn-primary" disabled>
+                    ○ 开始自动对账
+                </button>
+            </section>
+
+            <!-- 对账结果 -->
+            <section class="result-section" id="result-section" style="display: none;">
+                <h2><span class="section-icon">◩</span> 对账结果</h2>
+                
+                <!-- 汇总卡片 -->
+                <div class="summary-cards" id="summary-cards"></div>
+
+                <!-- 标签页 -->
+                <div class="tabs">
+                    <button class="tab-btn active" data-tab="matched">◉ 匹配明细</button>
+                    <button class="tab-btn" data-tab="issues">△ 差异明细</button>
+                </div>
+
+                <!-- 匹配明细 -->
+                <div class="tab-content active" id="matched-content">
+                    <div id="matched-one-to-one"></div>
+                    <div id="matched-aggregate"></div>
+                </div>
+
+                <!-- 差异明细 -->
+                <div class="tab-content" id="issues-content">
+                    <div id="issues-table"></div>
+                </div>
+
+                <!-- 导出按钮 -->
+                <div class="export-section">
+                    <button id="export-btn" class="btn-secondary">
+                        ↧ 导出对账结果
+                    </button>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>© 2026 自动对账系统 | 基于PRD v1.0开发</p>
+        </footer>
+    </div>
+
+    <!-- 加载遮罩 -->
+    <div class="loading-overlay" id="loading">
+        <div class="loading-spinner"></div>
+        <p>正在处理中...</p>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

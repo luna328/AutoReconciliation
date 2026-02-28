@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.ruff_cache/
+uploads/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
