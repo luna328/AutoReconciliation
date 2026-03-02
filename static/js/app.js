@@ -299,14 +299,11 @@ function displaySummaryCards(summary) {
 
 // 显示匹配结果
 function displayMatchedResults(result) {
-    // 完全匹配
+    // 完全匹配（行级真实配对）
     const oneToOneDiv = document.getElementById('matched-one-to-one');
-    if (result.matched_list && result.matched_list.length > 0) {
-        const displayCount = (result.matched_list || []).reduce((acc, m) => {
-            const v = (m.vendor_refs || []).length;
-            const i = (m.internal_refs || []).length;
-            return acc + Math.max(v, i, 1);
-        }, 0);
+    const matchedPairs = result.matched_pairs || [];
+    if (matchedPairs.length > 0) {
+        const displayCount = matchedPairs.length;
         const sectionId = 'matched-table-section';
         let html = '<h3 class="section-title">✅ 完全匹配（展示维度）(' + displayCount + ' 条) '
             + '<button class="expand-btn" style="margin-left: 10px;" onclick="toggleSection(\'' + sectionId + '\', this)">展开明细</button>'
@@ -324,7 +321,7 @@ function displayMatchedResults(result) {
         html += '<th>系统金额</th>';
         html += '</tr></thead><tbody>';
 
-        result.matched_list.forEach(match => {
+        matchedPairs.forEach(match => {
             const vRefs = match.vendor_refs || [];
             const iRefs = match.internal_refs || [];
             const maxLen = Math.max(vRefs.length, iRefs.length, 1);
@@ -352,9 +349,46 @@ function displayMatchedResults(result) {
         oneToOneDiv.innerHTML = '<div class="alert alert-warning">无完全匹配数据</div>';
     }
 
-    // 聚合匹配已移除，显示为空
+    // 分组视图：展示聚合后的完全匹配组
     const aggregateDiv = document.getElementById('matched-aggregate');
-    aggregateDiv.innerHTML = '';
+    const matchedGroups = result.matched_groups || result.matched_list || [];
+    if (matchedGroups.length > 0) {
+        const aggregateSectionId = 'matched-group-table-section';
+        let html = '<h3 class="section-title">📦 完全匹配（分组维度）(' + matchedGroups.length + ' 组) '
+            + '<button class="expand-btn" style="margin-left: 10px;" onclick="toggleSection(\'' + aggregateSectionId + '\', this)">展开明细</button>'
+            + '</h3>';
+        html += '<div id="' + aggregateSectionId + '" style="display:none; overflow-x: auto;"><table class="data-table">';
+        html += '<thead><tr>';
+        html += '<th>PO号</th>';
+        html += '<th>物料编码</th>';
+        html += '<th>供应商汇总数量</th>';
+        html += '<th>系统汇总数量</th>';
+        html += '<th>供应商汇总金额</th>';
+        html += '<th>系统汇总金额</th>';
+        html += '<th>供应商行数</th>';
+        html += '<th>系统行数</th>';
+        html += '</tr></thead><tbody>';
+
+        matchedGroups.forEach(group => {
+            const vCount = (group.vendor_refs || []).length;
+            const iCount = (group.internal_refs || []).length;
+            html += '<tr>';
+            html += `<td>${group.po_no || '-'}</td>`;
+            html += `<td>${group.item_code}</td>`;
+            html += `<td>${group.vendor_qty ?? '-'}</td>`;
+            html += `<td>${group.internal_qty ?? '-'}</td>`;
+            html += `<td>${group.vendor_amount != null ? Number(group.vendor_amount).toFixed(2) : '-'}</td>`;
+            html += `<td>${group.internal_amount != null ? Number(group.internal_amount).toFixed(2) : '-'}</td>`;
+            html += `<td>${vCount}</td>`;
+            html += `<td>${iCount}</td>`;
+            html += '</tr>';
+        });
+
+        html += '</tbody></table></div>';
+        aggregateDiv.innerHTML = html;
+    } else {
+        aggregateDiv.innerHTML = '';
+    }
 }
 
 function toggleSection(sectionId, btn) {
@@ -397,10 +431,12 @@ function displayIssues(result) {
         return html;
     };
 
-    const renderIssueSection = (title, count, rows, badgeClass, badgeText) => {
+    const renderIssueSection = (sectionId, title, count, rows, badgeClass, badgeText) => {
         if (!rows || rows.length === 0) return '';
-        let html = `<h3 class="section-title">⚠️ ${title} (${count} 条)</h3>`;
-        html += '<div style="overflow-x: auto;"><table class="data-table">';
+        let html = `<h3 class="section-title">⚠️ ${title} (${count} 条) `
+            + `<button class="expand-btn" style="margin-left: 10px;" onclick="toggleSection('${sectionId}', this)">收起明细</button>`
+            + '</h3>';
+        html += `<div id="${sectionId}" style="display:block; overflow-x: auto;"><table class="data-table">`;
         html += '<thead><tr>';
         html += '<th>PO号</th>';
         html += '<th>物料编码</th>';
@@ -419,6 +455,7 @@ function displayIssues(result) {
     };
 
     issuesHtml += renderIssueSection(
+        'issue-diff-items',
         '差异项 - 一方完全不存在',
         result.summary?.diff_items_display_count ?? result.diff_items?.length ?? 0,
         result.diff_items,
@@ -426,6 +463,7 @@ function displayIssues(result) {
         '差异项'
     );
     issuesHtml += renderIssueSection(
+        'issue-diff-qty',
         '数量差异 - PO+物料编码匹配，数量不一致',
         result.summary?.diff_qty_display_count ?? result.diff_qty?.length ?? 0,
         result.diff_qty,
@@ -433,6 +471,7 @@ function displayIssues(result) {
         '数量差异'
     );
     issuesHtml += renderIssueSection(
+        'issue-diff-price',
         '单价差异 - PO+物料编码匹配，单价不一致',
         result.summary?.diff_price_display_count ?? result.diff_price?.length ?? 0,
         result.diff_price,
@@ -440,6 +479,7 @@ function displayIssues(result) {
         '单价差异'
     );
     issuesHtml += renderIssueSection(
+        'issue-diff-amount',
         '金额差异 - PO+物料编码+数量+单价匹配，金额不一致',
         result.summary?.diff_amount_display_count ?? result.diff_amount?.length ?? 0,
         result.diff_amount,

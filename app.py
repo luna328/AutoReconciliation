@@ -45,8 +45,59 @@ current_task = {
     "result": None,
 }
 
-PO_PATTERN = re.compile(r"^LY20\d{6,}$", re.IGNORECASE)
-ITEM_PATTERN = re.compile(r"^(BC\d{5,}|ASE[0-9A-Z-]{3,})$", re.IGNORECASE)
+DEFAULT_PO_PATTERN = r"^LY20\d{6,}$"
+DEFAULT_ITEM_PATTERN = r"^(BC\d{5,}|ASE[0-9A-Z-]{3,})$"
+
+VENDOR_TEMPLATES = [
+    {
+        "name": "legacy_ly",
+        "filename_keywords": ["ly", "lianying", "联赢"],
+        "po_patterns": [DEFAULT_PO_PATTERN],
+        "item_patterns": [DEFAULT_ITEM_PATTERN],
+        "po_headers": ["po", "订单号", "订单号码", "订单单号", "采购单号", "po号"],
+        "item_headers": ["物料编码", "物料号", "料号", "item", "sku", "part"],
+    },
+    {
+        "name": "generic",
+        "filename_keywords": [],
+        "po_patterns": [
+            r"^PO[-_ ]?[A-Z0-9]{4,}$",
+            r"^[A-Z]{1,4}[-_ ]?\d{6,}$",
+            r"^\d{8,}$",
+        ],
+        "item_patterns": [
+            r"^[A-Z0-9][A-Z0-9._/-]{4,}$",
+            r"^\d{5,}$",
+        ],
+        "po_headers": ["po", "订单号", "订单号码", "订单单号", "采购单号", "po号"],
+        "item_headers": [
+            "物料编码",
+            "物料号",
+            "料号",
+            "货号",
+            "item",
+            "sku",
+            "part",
+            "pn",
+            "material",
+        ],
+    },
+]
+
+ALL_PO_PATTERNS = [
+    DEFAULT_PO_PATTERN,
+    r"^PO[-_ ]?[A-Z0-9]{4,}$",
+    r"^[A-Z]{1,4}[-_ ]?\d{6,}$",
+    r"^\d{8,}$",
+]
+ALL_ITEM_PATTERNS = [
+    DEFAULT_ITEM_PATTERN,
+    r"^[A-Z0-9][A-Z0-9._/-]{4,}$",
+    r"^\d{5,}$",
+]
+
+PO_REGEXES = [re.compile(p, re.IGNORECASE) for p in ALL_PO_PATTERNS]
+ITEM_REGEXES = [re.compile(p, re.IGNORECASE) for p in ALL_ITEM_PATTERNS]
 FOOTER_KEYWORDS = [
     "合计",
     "总计",
@@ -80,14 +131,193 @@ def _to_float(v):
 
 
 def _is_po(v):
-    return bool(PO_PATTERN.match(_to_text(v)))
+    text = _to_text(v)
+    return any(r.match(text) for r in PO_REGEXES)
 
 
 def _is_item(v):
-    return bool(ITEM_PATTERN.match(_to_text(v)))
+    text = _to_text(v)
+    return any(r.match(text) for r in ITEM_REGEXES)
 
 
-def detect_vendor_table_and_mapping(raw_df):
+def _compile_patterns(patterns):
+    return [re.compile(p, re.IGNORECASE) for p in (patterns or [])]
+
+
+def _pick_templates(vendor_hint=""):
+    hint = _to_text(vendor_hint).lower()
+    matched = []
+    for tpl in VENDOR_TEMPLATES:
+        kws = [k.lower() for k in tpl.get("filename_keywords", [])]
+        if kws and any(k in hint for k in kws):
+            matched.append(tpl)
+
+    generic = next((t for t in VENDOR_TEMPLATES if t.get("name") == "generic"), None)
+    if generic:
+        matched.append(generic)
+
+    # 去重保持顺序
+    seen = set()
+    ordered = []
+    for tpl in matched:
+        name = tpl.get("name")
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(tpl)
+    return ordered or VENDOR_TEMPLATES
+
+
+def _header_hit(col_name, keywords):
+    c = _to_text(col_name).lower()
+    if not c:
+        return 0
+    return 1 if any(k.lower() in c for k in keywords or []) else 0
+
+
+def infer_po_item_columns(table_df, sample_df, col_stats, vendor_hint=""):
+    templates = _pick_templates(vendor_hint)
+    candidates = []
+
+    for col in sample_df.columns:
+        vals = sample_df[col].tolist()
+        non_empty_vals = [_to_text(v) for v in vals if _to_text(v)]
+        total = max(len(vals), 1)
+        non_empty_ratio = len(non_empty_vals) / total
+        unique_ratio = (
+            len(set(non_empty_vals)) / len(non_empty_vals) if non_empty_vals else 0
+        )
+        repeat_ratio = 1 - unique_ratio if non_empty_vals else 0
+        avg_len = (
+            sum(len(v) for v in non_empty_vals) / len(non_empty_vals)
+            if non_empty_vals
+            else 0
+        )
+
+        po_score = 0.0
+        item_score = 0.0
+        reasons = []
+
+        # 模板层加分（先行）
+        for tpl in templates:
+            po_rs = _compile_patterns(tpl.get("po_patterns"))
+            item_rs = _compile_patterns(tpl.get("item_patterns"))
+            po_hit_ratio = (
+                sum(1 for v in non_empty_vals if any(r.match(v) for r in po_rs))
+                / len(non_empty_vals)
+                if non_empty_vals
+                else 0
+            )
+            item_hit_ratio = (
+                sum(1 for v in non_empty_vals if any(r.match(v) for r in item_rs))
+                / len(non_empty_vals)
+                if non_empty_vals
+                else 0
+            )
+
+            if po_hit_ratio > 0:
+                po_score += 4.0 * po_hit_ratio
+            if item_hit_ratio > 0:
+                item_score += 4.0 * item_hit_ratio
+
+            if _header_hit(col, tpl.get("po_headers")):
+                po_score += 2.2
+            if _header_hit(col, tpl.get("item_headers")):
+                item_score += 2.2
+
+        # 通用结构分
+        po_score += repeat_ratio * 1.2
+        item_score += repeat_ratio * 0.8
+
+        # 非空率过低时降权
+        po_score += max(0, non_empty_ratio - 0.2)
+        item_score += max(0, non_empty_ratio - 0.2)
+
+        # 长度特征（过短纯数字通常不是PO/物料编码）
+        if avg_len < 4:
+            po_score -= 1.2
+            item_score -= 1.2
+
+        # 明显数值列（数量/金额）降权
+        num_ratio = (
+            col_stats[col]["num_count"] / max(len(sample_df[col]), 1)
+            if col in col_stats
+            else 0
+        )
+        if num_ratio > 0.9 and avg_len <= 6:
+            po_score -= 1.4
+            item_score -= 1.4
+
+        reasons.append(
+            {
+                "non_empty_ratio": round(non_empty_ratio, 3),
+                "repeat_ratio": round(repeat_ratio, 3),
+                "avg_len": round(avg_len, 2),
+                "num_ratio": round(num_ratio, 3),
+            }
+        )
+
+        candidates.append(
+            {
+                "col": col,
+                "po_score": po_score,
+                "item_score": item_score,
+                "reasons": reasons,
+            }
+        )
+
+    if not candidates:
+        return {}, {"confidence": "low", "reason": "no_candidates"}
+
+    po_rank = sorted(candidates, key=lambda x: x["po_score"], reverse=True)
+    item_rank = sorted(candidates, key=lambda x: x["item_score"], reverse=True)
+
+    po_col = po_rank[0]["col"]
+    item_col = item_rank[0]["col"]
+
+    if po_col == item_col:
+        # 冲突时，分数优势小的一方用次优列
+        po_adv = po_rank[0]["po_score"] - (
+            po_rank[1]["po_score"] if len(po_rank) > 1 else -1e9
+        )
+        item_adv = item_rank[0]["item_score"] - (
+            item_rank[1]["item_score"] if len(item_rank) > 1 else -1e9
+        )
+        if po_adv >= item_adv and len(item_rank) > 1:
+            item_col = item_rank[1]["col"]
+        elif len(po_rank) > 1:
+            po_col = po_rank[1]["col"]
+
+    po_gap = po_rank[0]["po_score"] - (
+        po_rank[1]["po_score"] if len(po_rank) > 1 else 0
+    )
+    item_gap = item_rank[0]["item_score"] - (
+        item_rank[1]["item_score"] if len(item_rank) > 1 else 0
+    )
+
+    if po_gap >= 1.5 and item_gap >= 1.5:
+        confidence = "high"
+    elif po_gap >= 0.7 and item_gap >= 0.7:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    suggested = {"po_no": po_col, "item_code": item_col}
+    meta = {
+        "confidence": confidence,
+        "po_top": [
+            {"column": r["col"], "score": round(r["po_score"], 3)} for r in po_rank[:3]
+        ],
+        "item_top": [
+            {"column": r["col"], "score": round(r["item_score"], 3)}
+            for r in item_rank[:3]
+        ],
+        "templates": [t.get("name") for t in templates],
+    }
+    return suggested, meta
+
+
+def detect_vendor_table_and_mapping(raw_df, vendor_hint=""):
     scan_limit = min(len(raw_df), 200)
     data_start = None
 
@@ -149,13 +379,10 @@ def detect_vendor_table_and_mapping(raw_df):
 
     suggested = {}
 
-    po_col = max(sample.columns, key=lambda c: col_stats[c]["po"], default=None)
-    if po_col and col_stats[po_col]["po"] > 0:
-        suggested["po_no"] = po_col
-
-    item_col = max(sample.columns, key=lambda c: col_stats[c]["item"], default=None)
-    if item_col and col_stats[item_col]["item"] > 0:
-        suggested["item_code"] = item_col
+    po_item_suggested, _meta = infer_po_item_columns(
+        table_df, sample, col_stats, vendor_hint
+    )
+    suggested.update(po_item_suggested)
 
     qty_kw = [c for c in sample.columns if any(k in c for k in ["数量", "數量", "qty"])]
     price_kw = [
@@ -285,7 +512,7 @@ def build_row_refs(rows):
     ]
 
 
-def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001):
+def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001, qty_tolerance=0):
     """在数量差异组内做行级配对，只返回未配对残差行用于展示。"""
     v_used = [False] * len(v_rows)
     i_used = [False] * len(i_rows)
@@ -301,7 +528,10 @@ def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001):
                 continue
             iq = ir.get("qty")
             ip = ir.get("unit_price")
-            if vq == iq and abs(float(vp) - float(ip)) <= price_tolerance:
+            if (
+                abs(float(vq) - float(iq)) <= qty_tolerance
+                and abs(float(vp) - float(ip)) <= price_tolerance
+            ):
                 v_used[vi] = True
                 i_used[ii] = True
                 break
@@ -314,7 +544,8 @@ def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001):
         for ii, ir in enumerate(i_rows):
             if i_used[ii]:
                 continue
-            if vq == ir.get("qty"):
+            iq = ir.get("qty")
+            if abs(float(vq) - float(iq)) <= qty_tolerance:
                 v_used[vi] = True
                 i_used[ii] = True
                 break
@@ -322,6 +553,29 @@ def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001):
     v_remain = [r for idx, r in enumerate(v_rows) if not v_used[idx]]
     i_remain = [r for idx, r in enumerate(i_rows) if not i_used[idx]]
     return v_remain, i_remain
+
+
+def _pair_rows(v_rows, i_rows, match_fn):
+    """按给定规则做一对一贪心配对。"""
+    v_used = [False] * len(v_rows)
+    i_used = [False] * len(i_rows)
+    pairs = []
+
+    for vi, vr in enumerate(v_rows):
+        if v_used[vi]:
+            continue
+        for ii, ir in enumerate(i_rows):
+            if i_used[ii]:
+                continue
+            if match_fn(vr, ir):
+                v_used[vi] = True
+                i_used[ii] = True
+                pairs.append((vr, ir))
+                break
+
+    v_remain = [r for idx, r in enumerate(v_rows) if not v_used[idx]]
+    i_remain = [r for idx, r in enumerate(i_rows) if not i_used[idx]]
+    return pairs, v_remain, i_remain
 
 
 # 默认列映射配置
@@ -371,7 +625,7 @@ def upload_vendor_file():
 
         # 读取文件并自动识别表头/字段（基于内容模式）
         raw_df = pd.read_excel(filepath, header=None)
-        df, suggested = detect_vendor_table_and_mapping(raw_df)
+        df, suggested = detect_vendor_table_and_mapping(raw_df, file.filename)
         if df is None or len(df) == 0:
             # 兜底：沿用固定表头行
             df = pd.read_excel(filepath, header=4)
@@ -590,7 +844,9 @@ def perform_reconciliation(
     all_keys = set(vendor_grouped["po_item_key"]) | set(internal_grouped["po_item_key"])
 
     # 分类结果
-    matched_list = []
+    matched_list = []  # 分组级完全匹配
+    matched_pairs = []  # 行级完全匹配（真实配对）
+    matched_groups = []  # 仅用于前端展示分组视图
     diff_items = []  # 差异项：一方完全不存在
     diff_qty = []  # 数量差异
     diff_price = []  # 单价差异
@@ -652,10 +908,63 @@ def perform_reconciliation(
             )
             continue
 
+        # 行级严格匹配：数量+单价+金额均在容差内
+        strict_pairs, v_unmatched, i_unmatched = _pair_rows(
+            v_rows,
+            i_rows,
+            lambda vr, ir: (
+                abs(float(vr.get("qty", 0)) - float(ir.get("qty", 0))) <= qty_tolerance
+                and abs(float(vr.get("unit_price", 0)) - float(ir.get("unit_price", 0)))
+                <= price_tolerance
+                and abs(float(vr.get("amount", 0)) - float(ir.get("amount", 0)))
+                <= amount_tolerance
+            ),
+        )
+
+        # 完全匹配：组内每一行都能完成严格配对
+        if not v_unmatched and not i_unmatched:
+            for vr, ir in strict_pairs:
+                matched_pairs.append(
+                    {
+                        "po_no": vr.get("po_no"),
+                        "item_code": vr.get("item_code_clean"),
+                        "vendor_qty": vr.get("qty"),
+                        "internal_qty": ir.get("qty"),
+                        "vendor_price": vr.get("unit_price"),
+                        "internal_price": ir.get("unit_price"),
+                        "vendor_amount": vr.get("amount"),
+                        "internal_amount": ir.get("amount"),
+                        "vendor_rows": [vr],
+                        "internal_rows": [ir],
+                        "vendor_refs": build_row_refs([vr]),
+                        "internal_refs": build_row_refs([ir]),
+                        "diff_type": "完全匹配",
+                    }
+                )
+
+            group_row = {
+                "po_no": v_rows[0]["po_no"],
+                "item_code": v_rows[0]["item_code_clean"],
+                "vendor_qty": v_sum_qty,
+                "internal_qty": i_sum_qty,
+                "vendor_price": v_unit_price,
+                "internal_price": i_unit_price,
+                "vendor_amount": v_sum_amount,
+                "internal_amount": i_sum_amount,
+                "vendor_rows": v_rows,
+                "internal_rows": i_rows,
+                "vendor_refs": vendor_refs,
+                "internal_refs": internal_refs,
+                "diff_type": "完全匹配",
+            }
+            matched_list.append(group_row)
+            matched_groups.append(group_row)
+            continue
+
         # 2. 数量差异：PO+物料编码匹配上了，但数量不一致
         if abs(v_sum_qty - i_sum_qty) > qty_tolerance:
             v_remain, i_remain = split_qty_residual_rows(
-                v_rows, i_rows, price_tolerance
+                v_rows, i_rows, price_tolerance, qty_tolerance
             )
             diff_qty.append(
                 {
@@ -676,8 +985,19 @@ def perform_reconciliation(
             )
             continue
 
-        # 3. 单价差异：PO+物料编码匹配上了，但单价不一致
-        if abs(v_unit_price - i_unit_price) > price_tolerance:
+        # 数量总和一致时，先看是否可按 数量+单价 配对（只剩金额差）
+        _, qp_v_remain, qp_i_remain = _pair_rows(
+            v_rows,
+            i_rows,
+            lambda vr, ir: (
+                abs(float(vr.get("qty", 0)) - float(ir.get("qty", 0))) <= qty_tolerance
+                and abs(float(vr.get("unit_price", 0)) - float(ir.get("unit_price", 0)))
+                <= price_tolerance
+            ),
+        )
+
+        # 3. 单价差异：数量一致但无法按 数量+单价 配对，说明单价结构不一致
+        if qp_v_remain or qp_i_remain:
             diff_price.append(
                 {
                     "po_no": v_rows[0]["po_no"],
@@ -697,7 +1017,7 @@ def perform_reconciliation(
             )
             continue
 
-        # 4. 金额差异：PO+物料编码+数量+单价都匹配上了，但金额不一致
+        # 4. 金额差异：可按 数量+单价 配对，但金额不一致
         if abs(v_sum_amount - i_sum_amount) > amount_tolerance:
             diff_amount.append(
                 {
@@ -718,8 +1038,8 @@ def perform_reconciliation(
             )
             continue
 
-        # 完全匹配
-        matched_list.append(
+        # 兜底：理论上很少走到，归入金额差异，避免误判为完全匹配
+        diff_amount.append(
             {
                 "po_no": v_rows[0]["po_no"],
                 "item_code": v_rows[0]["item_code_clean"],
@@ -733,18 +1053,15 @@ def perform_reconciliation(
                 "internal_rows": i_rows,
                 "vendor_refs": vendor_refs,
                 "internal_refs": internal_refs,
-                "diff_type": "完全匹配",
+                "diff_type": "金额差异",
             }
         )
 
     # 计算统计信息
     total_vendor_amount = vendor_std["amount"].sum() if len(vendor_std) > 0 else 0
     total_internal_amount = internal_std["amount"].sum() if len(internal_std) > 0 else 0
-    matched_amount = sum(m["vendor_amount"] for m in matched_list)
-    matched_display_count = sum(
-        max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
-        for m in matched_list
-    )
+    matched_amount = sum(m["vendor_amount"] for m in matched_pairs)
+    matched_display_count = len(matched_pairs)
     diff_items_display_count = sum(
         max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
         for m in diff_items
@@ -762,8 +1079,8 @@ def perform_reconciliation(
         for m in diff_amount
     )
 
-    matched_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in matched_list)
-    matched_internal_lines = sum(len(m.get("internal_rows", [])) for m in matched_list)
+    matched_vendor_lines = len(matched_pairs)
+    matched_internal_lines = len(matched_pairs)
     diff_items_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_items)
     diff_items_internal_lines = sum(len(m.get("internal_rows", [])) for m in diff_items)
     diff_qty_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_qty)
@@ -805,6 +1122,8 @@ def perform_reconciliation(
             "diff_amount": round(total_vendor_amount - total_internal_amount, 2),
         },
         "matched_list": matched_list,
+        "matched_pairs": matched_pairs,
+        "matched_groups": matched_groups,
         "diff_items": diff_items,
         "diff_qty": diff_qty,
         "diff_price": diff_price,
