@@ -7,24 +7,69 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1><span class="icon-badge">◎</span> 自动对账系统</h1>
-            <p>上传供应商对账单和系统入库单，自动完成数据匹配与差异分析</p>
-            <div class="theme-switcher">
-                <label for="theme-select">主题</label>
-                <select id="theme-select">
-                    <option value="sage">鼠尾草绿</option>
-                    <option value="purple">淡雅紫</option>
-                    <option value="mist">雾蓝灰</option>
-                    <option value="sand">暖米杏</option>
-                </select>
+    <div class="app-shell" id="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-head">
+                <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="收缩侧边栏">‹</button>
+                <div class="brand">
+                    <div class="brand-mark">◉</div>
+                    <div class="brand-text">
+                        <strong>AutoRecon</strong>
+                        <span>智能对账控制台</span>
+                    </div>
+                </div>
             </div>
-        </header>
 
-        <main>
-            <!-- 文件上传区域 -->
-            <section class="upload-section">
+            <nav class="side-nav" aria-label="主导航">
+                <a class="side-link active" href="#overview-section" data-nav-target="overview-section"><span>◌</span><em>概览</em></a>
+                <a class="side-link" href="#upload-section" data-nav-target="upload-section"><span>⇪</span><em>文件上传</em></a>
+                <a class="side-link" href="#mapping-section" data-nav-target="mapping-section"><span>⌗</span><em>字段映射</em></a>
+                <a class="side-link" id="tolerance-nav-link" href="#" data-action="open-tolerance"><span>≈</span><em>容差设置</em></a>
+                <a class="side-link" href="#result-section" data-nav-target="result-section"><span>▣</span><em>对账结果</em></a>
+                <a class="side-link" href="#export-anchor" data-nav-target="export-anchor"><span>↧</span><em>导出结果</em></a>
+            </nav>
+        </aside>
+
+        <div class="sidebar-resizer" id="sidebar-resizer" aria-hidden="true" title="拖动调整侧边栏宽度"></div>
+
+        <div class="main-panel">
+            <header class="topbar">
+                <button id="sidebar-open" class="sidebar-open" type="button" aria-label="打开侧边栏">≡</button>
+                <div class="topbar-title">
+                    <h1>自动对账系统</h1>
+                    <p>商业化对账工作台 - 快速上传、智能匹配、差异追踪</p>
+                </div>
+                <div class="theme-switcher">
+                    <label for="theme-select">主题</label>
+                    <select id="theme-select">
+                        <option value="sage">科技蓝（默认）</option>
+                        <option value="purple">极光紫</option>
+                        <option value="mist">雾蓝灰</option>
+                        <option value="sand">暖砂杏</option>
+                    </select>
+                </div>
+            </header>
+
+            <main class="workspace">
+            <section class="dashboard-section" id="overview-section">
+                <h2><span class="section-icon">◎</span> 概览</h2>
+                <div class="kpi-grid">
+                    <div class="kpi-card">
+                        <h3>供应商文件</h3>
+                        <p id="kpi-vendor">未上传</p>
+                    </div>
+                    <div class="kpi-card">
+                        <h3>入库文件</h3>
+                        <p id="kpi-internal">未上传</p>
+                    </div>
+                    <div class="kpi-card">
+                        <h3>对账状态</h3>
+                        <p id="kpi-status">待开始</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="upload-section" id="upload-section">
                 <h2><span class="section-icon">◧</span> 文件上传</h2>
                 <div class="upload-grid">
                     <div class="upload-card" id="vendor-upload">
@@ -53,29 +98,9 @@
                 </div>
             </section>
 
-            <!-- 配置区域 -->
-            <section class="config-section">
-                <h2><span class="section-icon">◇</span> 对账配置</h2>
+            <section class="config-section" id="mapping-section">
+                <h2><span class="section-icon">◇</span> 字段映射</h2>
                 <div class="config-grid">
-                    <div class="config-card">
-                        <h3>容差设置</h3>
-                        <div class="form-group">
-                            <label>价格容差</label>
-                            <input type="number" id="price-tolerance" value="0.0001" step="0.0001">
-                            <small>单价差异在此范围内视为匹配</small>
-                        </div>
-                        <div class="form-group">
-                            <label>数量容差</label>
-                            <input type="number" id="qty-tolerance" value="0" step="1">
-                            <small>数量差异在此范围内视为匹配</small>
-                        </div>
-                        <div class="form-group">
-                            <label>金额容差</label>
-                            <input type="number" id="amount-tolerance" value="0.01" step="0.01">
-                            <small>金额差异在此范围内视为匹配</small>
-                        </div>
-                    </div>
-
                     <div class="config-card">
                         <h3>供应商列映射</h3>
                         <div class="form-group">
@@ -126,14 +151,20 @@
                 </div>
             </section>
 
-            <!-- 操作按钮 -->
             <section class="action-section">
-                <button id="reconcile-btn" class="btn-primary" disabled>
-                    ○ 开始自动对账
-                </button>
+                <div class="reconcile-bar">
+                    <div class="tolerance-summary-wrap">
+                        <span class="summary-label">容差配置</span>
+                        <strong id="tolerance-summary">价格 0.0001 | 数量 0 | 金额 0.01</strong>
+                        <span class="summary-state" id="tolerance-state">默认</span>
+                    </div>
+                    <button id="edit-tolerance-btn" class="btn-ghost" type="button">编辑容差</button>
+                    <button id="reconcile-btn" class="btn-primary" disabled>
+                        ○ 开始自动对账
+                    </button>
+                </div>
             </section>
 
-            <!-- 对账结果 -->
             <section class="result-section" id="result-section" style="display: none;">
                 <h2><span class="section-icon">◩</span> 对账结果</h2>
                 
@@ -157,19 +188,47 @@
                     <div id="issues-table"></div>
                 </div>
 
-                <!-- 导出按钮 -->
-                <div class="export-section">
+                <div class="export-section" id="export-anchor">
                     <button id="export-btn" class="btn-secondary">
                         ↧ 导出对账结果
                     </button>
                 </div>
             </section>
-        </main>
 
-        <footer>
-            <p>© 2026 自动对账系统 | 基于PRD v1.0开发</p>
-        </footer>
+            <footer>
+                <p>© 2026 自动对账系统 | 智能对账控制台</p>
+            </footer>
+            </main>
+        </div>
     </div>
+
+    <div class="drawer-backdrop" id="drawer-backdrop"></div>
+    <aside class="tolerance-drawer" id="tolerance-drawer" aria-hidden="true">
+        <div class="drawer-header">
+            <h3>容差设置</h3>
+            <button id="drawer-close-btn" class="drawer-close" type="button" aria-label="关闭">×</button>
+        </div>
+        <p class="drawer-desc">用于控制匹配的灵敏度。越小越严格，越大越宽松。</p>
+        <div class="form-group">
+            <label>价格容差</label>
+            <input type="number" id="price-tolerance" value="0.0001" step="0.0001">
+            <small>单价差异在此范围内视为匹配</small>
+        </div>
+        <div class="form-group">
+            <label>数量容差</label>
+            <input type="number" id="qty-tolerance" value="0" step="1">
+            <small>数量差异在此范围内视为匹配</small>
+        </div>
+        <div class="form-group">
+            <label>金额容差</label>
+            <input type="number" id="amount-tolerance" value="0.01" step="0.01">
+            <small>金额差异在此范围内视为匹配</small>
+        </div>
+        <div class="drawer-actions">
+            <button id="reset-tolerance-btn" class="btn-ghost" type="button">恢复默认</button>
+            <button id="save-tolerance-btn" class="btn-secondary" type="button">保存并关闭</button>
+        </div>
+    </aside>
 
     <!-- 加载遮罩 -->
     <div class="loading-overlay" id="loading">

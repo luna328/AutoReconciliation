@@ -2,15 +2,223 @@
 let vendorData = null;
 let internalData = null;
 let reconcileResult = null;
+const toleranceDefaults = {
+    price: 0.0001,
+    qty: 0,
+    amount: 0.01
+};
 
 // DOM加载完成后初始化
 document.addEventListener('DOMContentLoaded', function() {
+    initSidebarNavigation();
     initThemeSwitcher();
     initFileUploads();
     initTabs();
     initReconcileButton();
     initExportButton();
+    initDashboardKpis();
+    initToleranceDrawer();
 });
+
+function initSidebarNavigation() {
+    const appShell = document.getElementById('app-shell');
+    const toggleBtn = document.getElementById('sidebar-toggle');
+    const openBtn = document.getElementById('sidebar-open');
+    const resizer = document.getElementById('sidebar-resizer');
+    const navLinks = document.querySelectorAll('.side-link');
+
+    if (!appShell) return;
+
+    const collapsedSaved = localStorage.getItem('sidebar_collapsed') === '1';
+    if (collapsedSaved) {
+        appShell.classList.add('sidebar-collapsed');
+        if (toggleBtn) toggleBtn.textContent = '›';
+    } else {
+        const savedWidth = parseInt(localStorage.getItem('sidebar_width') || '268', 10);
+        if (!Number.isNaN(savedWidth)) {
+            const clamped = Math.max(220, Math.min(420, savedWidth));
+            appShell.style.setProperty('--sidebar-width', `${clamped}px`);
+        }
+    }
+
+    if (toggleBtn) {
+        toggleBtn.addEventListener('click', function() {
+            const collapsed = appShell.classList.toggle('sidebar-collapsed');
+            toggleBtn.textContent = collapsed ? '›' : '‹';
+            localStorage.setItem('sidebar_collapsed', collapsed ? '1' : '0');
+            if (!collapsed) {
+                const savedWidth = parseInt(localStorage.getItem('sidebar_width') || '268', 10);
+                const clamped = Number.isNaN(savedWidth) ? 268 : Math.max(220, Math.min(420, savedWidth));
+                appShell.style.setProperty('--sidebar-width', `${clamped}px`);
+            }
+        });
+    }
+
+    if (resizer) {
+        resizer.addEventListener('mousedown', (event) => {
+            if (window.innerWidth <= 860 || appShell.classList.contains('sidebar-collapsed')) return;
+
+            event.preventDefault();
+            const minWidth = 220;
+            const maxWidth = 420;
+            document.body.classList.add('sidebar-resizing');
+
+            const onMouseMove = (moveEvent) => {
+                const width = Math.max(minWidth, Math.min(maxWidth, moveEvent.clientX));
+                appShell.style.setProperty('--sidebar-width', `${width}px`);
+            };
+
+            const onMouseUp = () => {
+                document.body.classList.remove('sidebar-resizing');
+                const current = parseInt(getComputedStyle(appShell).getPropertyValue('--sidebar-width'), 10);
+                if (!Number.isNaN(current)) {
+                    localStorage.setItem('sidebar_width', String(current));
+                }
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            };
+
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+    }
+
+    if (openBtn) {
+        openBtn.addEventListener('click', function() {
+            appShell.classList.toggle('sidebar-opened');
+        });
+    }
+
+    navLinks.forEach((link) => {
+        link.addEventListener('click', function(e) {
+            if (this.dataset.action === 'open-tolerance') {
+                e.preventDefault();
+                openToleranceDrawer();
+                appShell.classList.remove('sidebar-opened');
+                return;
+            }
+
+            e.preventDefault();
+            const targetId = this.dataset.navTarget;
+            const target = document.getElementById(targetId);
+            if (target) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                setActiveNav(targetId);
+            }
+            appShell.classList.remove('sidebar-opened');
+        });
+    });
+
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+            if (entry.isIntersecting) {
+                setActiveNav(entry.target.id);
+            }
+        });
+    }, { threshold: 0.35 });
+
+    document.querySelectorAll('section[id]').forEach((section) => observer.observe(section));
+}
+
+function setActiveNav(targetId) {
+    document.querySelectorAll('.side-link').forEach((link) => {
+        link.classList.toggle('active', link.dataset.navTarget === targetId);
+    });
+}
+
+function initDashboardKpis() {
+    updateKpi('kpi-vendor', '未上传');
+    updateKpi('kpi-internal', '未上传');
+    updateKpi('kpi-status', '待开始');
+}
+
+function updateKpi(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+}
+
+function initToleranceDrawer() {
+    const editBtn = document.getElementById('edit-tolerance-btn');
+    const closeBtn = document.getElementById('drawer-close-btn');
+    const saveBtn = document.getElementById('save-tolerance-btn');
+    const resetBtn = document.getElementById('reset-tolerance-btn');
+    const backdrop = document.getElementById('drawer-backdrop');
+
+    if (editBtn) editBtn.addEventListener('click', openToleranceDrawer);
+    if (closeBtn) closeBtn.addEventListener('click', closeToleranceDrawer);
+    if (saveBtn) {
+        saveBtn.addEventListener('click', () => {
+            updateToleranceSummary();
+            closeToleranceDrawer();
+        });
+    }
+    if (resetBtn) {
+        resetBtn.addEventListener('click', () => {
+            setToleranceValues(toleranceDefaults);
+            updateToleranceSummary();
+        });
+    }
+    if (backdrop) backdrop.addEventListener('click', closeToleranceDrawer);
+
+    ['price-tolerance', 'qty-tolerance', 'amount-tolerance'].forEach((id) => {
+        const input = document.getElementById(id);
+        if (input) {
+            input.addEventListener('input', updateToleranceSummary);
+        }
+    });
+
+    updateToleranceSummary();
+}
+
+function openToleranceDrawer() {
+    const drawer = document.getElementById('tolerance-drawer');
+    const backdrop = document.getElementById('drawer-backdrop');
+    if (!drawer || !backdrop) return;
+    drawer.classList.add('open');
+    drawer.setAttribute('aria-hidden', 'false');
+    backdrop.classList.add('show');
+}
+
+function closeToleranceDrawer() {
+    const drawer = document.getElementById('tolerance-drawer');
+    const backdrop = document.getElementById('drawer-backdrop');
+    if (!drawer || !backdrop) return;
+    drawer.classList.remove('open');
+    drawer.setAttribute('aria-hidden', 'true');
+    backdrop.classList.remove('show');
+}
+
+function setToleranceValues(values) {
+    const price = document.getElementById('price-tolerance');
+    const qty = document.getElementById('qty-tolerance');
+    const amount = document.getElementById('amount-tolerance');
+
+    if (price) price.value = values.price;
+    if (qty) qty.value = values.qty;
+    if (amount) amount.value = values.amount;
+}
+
+function updateToleranceSummary() {
+    const summary = document.getElementById('tolerance-summary');
+    const state = document.getElementById('tolerance-state');
+    const priceVal = parseFloat(document.getElementById('price-tolerance')?.value || toleranceDefaults.price);
+    const qtyVal = parseFloat(document.getElementById('qty-tolerance')?.value || toleranceDefaults.qty);
+    const amountVal = parseFloat(document.getElementById('amount-tolerance')?.value || toleranceDefaults.amount);
+
+    if (summary) {
+        summary.textContent = `价格 ${priceVal} | 数量 ${qtyVal} | 金额 ${amountVal}`;
+    }
+
+    const custom =
+        priceVal !== toleranceDefaults.price ||
+        qtyVal !== toleranceDefaults.qty ||
+        amountVal !== toleranceDefaults.amount;
+
+    if (state) {
+        state.textContent = custom ? '已自定义' : '默认';
+        state.classList.toggle('custom', custom);
+    }
+}
 
 function initThemeSwitcher() {
     const select = document.getElementById('theme-select');
@@ -131,6 +339,16 @@ function displayFileInfo(type, data) {
         <strong>文件名：</strong>${data.filename}<br>
         <strong>行数：</strong>${data.row_count} 行
     `;
+
+    if (type === 'vendor') {
+        updateKpi('kpi-vendor', `${data.row_count} 行`);
+    } else {
+        updateKpi('kpi-internal', `${data.row_count} 行`);
+    }
+
+    if (vendorData && internalData) {
+        updateKpi('kpi-status', '可开始对账');
+    }
 }
 
 // 显示预览表格
@@ -221,6 +439,7 @@ async function performReconcile() {
     };
 
     setReconcileLoading(true);
+    updateKpi('kpi-status', '对账中');
 
     try {
         const response = await fetch('/api/reconcile', {
@@ -236,11 +455,14 @@ async function performReconcile() {
         if (result.success) {
             reconcileResult = result.result;
             displayResults(reconcileResult);
+            updateKpi('kpi-status', '已完成');
         } else {
             alert('对账失败：' + result.error);
+            updateKpi('kpi-status', '对账失败');
         }
     } catch (error) {
         alert('对账出错：' + error.message);
+        updateKpi('kpi-status', '对账失败');
     } finally {
         setReconcileLoading(false);
     }
@@ -259,6 +481,7 @@ function setReconcileLoading(isLoading) {
 function displayResults(result) {
     const resultSection = document.getElementById('result-section');
     resultSection.style.display = 'block';
+    setActiveNav('result-section');
 
     // 显示汇总卡片
     displaySummaryCards(result.summary);
@@ -269,8 +492,14 @@ function displayResults(result) {
     // 显示差异明细
     displayIssues(result);
 
-    // 滚动到结果区域
-    resultSection.scrollIntoView({ behavior: 'smooth' });
+    // 滚动到结果区域顶部
+    requestAnimationFrame(() => {
+        const top = resultSection.getBoundingClientRect().top + window.scrollY - 8;
+        window.scrollTo({
+            top: Math.max(0, top),
+            behavior: 'smooth'
+        });
+    });
 }
 
 // 显示汇总卡片
