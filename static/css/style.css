@@ -790,6 +790,21 @@ section h2 {
     color: var(--danger-text);
 }
 
+.issue-hint-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 6px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #245c9e;
+    background: rgba(74, 136, 226, 0.16);
+    border: 1px solid rgba(74, 136, 226, 0.34);
+    vertical-align: middle;
+}
+
 .section-title {
     color: var(--heading);
     margin: 20px 0 10px;
@@ -927,6 +942,88 @@ section h2 {
     display: flex;
 }
 
+.usage-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(18, 36, 66, 0.3);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 0.2s ease;
+    z-index: 1001;
+}
+
+.usage-modal-backdrop.show {
+    opacity: 1;
+    visibility: visible;
+}
+
+.usage-modal {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.96);
+    width: min(520px, calc(100vw - 32px));
+    background: #f8fbff;
+    border: 1px solid var(--border-soft);
+    border-radius: 14px;
+    box-shadow: 0 16px 36px rgba(35, 63, 105, 0.2);
+    padding: 20px 18px;
+    opacity: 0;
+    visibility: hidden;
+    transition: transform 0.2s ease, opacity 0.2s ease;
+    z-index: 1002;
+}
+
+.usage-modal.show {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, -50%) scale(1);
+}
+
+.usage-modal h3 {
+    color: var(--heading);
+    margin-bottom: 10px;
+}
+
+.usage-modal ul {
+    margin-left: 18px;
+    color: var(--text);
+    line-height: 1.7;
+}
+
+.usage-contact {
+    margin-top: 12px;
+    color: #365a87;
+    font-size: 0.92rem;
+}
+
+.usage-modal-footer {
+    margin-top: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.usage-skip-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    user-select: none;
+}
+
+.usage-skip-label input {
+    width: 14px;
+    height: 14px;
+}
+
+.usage-confirm-btn {
+    margin-top: 0;
+    min-width: 120px;
+}
+
 .loading-spinner {
     width: 48px;
     height: 48px;
@@ -1034,5 +1131,19 @@ footer {
 
     .tolerance-drawer.open {
         transform: translateY(0);
+    }
+
+    .usage-modal {
+        width: calc(100vw - 24px);
+        padding: 16px;
+    }
+
+    .usage-modal-footer {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .usage-confirm-btn {
+        width: 100%;
     }
 }

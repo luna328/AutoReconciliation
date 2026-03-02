@@ -18,7 +18,71 @@ document.addEventListener('DOMContentLoaded', function() {
     initExportButton();
     initDashboardKpis();
     initToleranceDrawer();
+    initUsageModal();
 });
+
+async function initUsageModal() {
+    const modal = document.getElementById('usage-modal');
+    const backdrop = document.getElementById('usage-modal-backdrop');
+    const confirmBtn = document.getElementById('usage-modal-confirm');
+    const titleEl = document.getElementById('usage-modal-title');
+    const stepsEl = document.getElementById('usage-modal-steps');
+    const contactEl = document.getElementById('usage-modal-contact');
+    const skipTodayCheckbox = document.getElementById('usage-modal-skip-today');
+    const skipTodayText = document.getElementById('usage-modal-skip-text');
+    if (!modal || !backdrop || !confirmBtn || !titleEl || !stepsEl || !contactEl || !skipTodayCheckbox || !skipTodayText) return;
+
+    const todayKey = `usage_modal_skip_${new Date().toISOString().slice(0, 10)}`;
+    if (localStorage.getItem(todayKey) === '1') return;
+
+    const defaultConfig = {
+        title: '使用方法',
+        steps: [
+            '先上传供应商对账单和系统入库单。',
+            '检查字段映射是否正确，必要时手动调整。',
+            '点击开始自动对账，查看匹配和差异结果。',
+            '确认无误后导出对账结果。'
+        ],
+        contact: 'BUG反馈邮箱：2510429772@qq.com',
+        confirmText: '我知道了',
+        skipTodayText: '今日不再提醒'
+    };
+
+    let config = defaultConfig;
+    try {
+        const resp = await fetch('/static/json/usage-modal.json', { cache: 'no-store' });
+        if (resp.ok) {
+            const data = await resp.json();
+            config = {
+                ...defaultConfig,
+                ...data,
+                steps: Array.isArray(data.steps) && data.steps.length > 0 ? data.steps : defaultConfig.steps,
+            };
+        }
+    } catch (_) {
+        config = defaultConfig;
+    }
+
+    titleEl.textContent = config.title;
+    stepsEl.innerHTML = config.steps.map((s) => `<li>${s}</li>`).join('');
+    contactEl.textContent = config.contact;
+    confirmBtn.textContent = config.confirmText;
+    skipTodayText.textContent = config.skipTodayText;
+
+    const close = () => {
+        if (skipTodayCheckbox.checked) {
+            localStorage.setItem(todayKey, '1');
+        }
+        modal.classList.remove('show');
+        backdrop.classList.remove('show');
+    };
+
+    modal.classList.add('show');
+    backdrop.classList.add('show');
+
+    confirmBtn.addEventListener('click', close);
+    backdrop.addEventListener('click', close);
+}
 
 function initSidebarNavigation() {
     const appShell = document.getElementById('app-shell');
@@ -633,6 +697,46 @@ function displayIssues(result) {
     const issuesDiv = document.getElementById('issues-table');
     
     let issuesHtml = '';
+    const diffItems = result.diff_items || [];
+    const vendorOnlyItems = diffItems.filter((row) => {
+        const vRefs = row.vendor_refs || [];
+        const iRefs = row.internal_refs || [];
+        return vRefs.length > 0 && iRefs.length === 0;
+    });
+    const internalOnlyItems = diffItems.filter((row) => {
+        const vRefs = row.vendor_refs || [];
+        const iRefs = row.internal_refs || [];
+        return iRefs.length > 0 && vRefs.length === 0;
+    });
+
+    const normalizeQty = (value) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? String(n) : String(value ?? '').trim();
+    };
+
+    const vendorOnlyKeys = new Set(
+        vendorOnlyItems
+            .map((row) => `${String(row.item_code || '').trim()}|${normalizeQty(row.vendor_qty)}`)
+            .filter((key) => !key.startsWith('|'))
+    );
+    const internalOnlyKeys = new Set(
+        internalOnlyItems
+            .map((row) => `${String(row.item_code || '').trim()}|${normalizeQty(row.internal_qty)}`)
+            .filter((key) => !key.startsWith('|'))
+    );
+
+    const withReasonHint = (rows, oppositeKeySet, qtyField) =>
+        rows.map((row) => {
+            const itemCode = String(row.item_code || '').trim();
+            const key = `${itemCode}|${normalizeQty(row[qtyField])}`;
+            const reasonHint = oppositeKeySet.has(key)
+                ? '疑似PO不一致'
+                : '对侧无同数量物料';
+            return { ...row, reason_hint: reasonHint };
+        });
+
+    const vendorOnlyWithReason = withReasonHint(vendorOnlyItems, internalOnlyKeys, 'vendor_qty');
+    const internalOnlyWithReason = withReasonHint(internalOnlyItems, vendorOnlyKeys, 'internal_qty');
 
     const renderIssueRows = (rows, badgeClass, badgeText) => {
         let html = '';
@@ -653,7 +757,7 @@ function displayIssues(result) {
                 html += `<td>${ir && ir.unit_price != null ? Number(ir.unit_price).toFixed(4) : '-'}</td>`;
                 html += `<td>${vr && vr.amount != null ? Number(vr.amount).toFixed(2) : '-'}</td>`;
                 html += `<td>${ir && ir.amount != null ? Number(ir.amount).toFixed(2) : '-'}</td>`;
-                html += `<td><span class="badge ${badgeClass}">${badgeText}</span></td>`;
+                html += `<td><span class="badge ${badgeClass}">${badgeText}</span>${row.reason_hint === '疑似PO不一致' ? '<span class="issue-hint-chip" title="疑似PO不一致">PO?</span>' : ''}</td>`;
                 html += '</tr>';
             }
         });
@@ -684,16 +788,24 @@ function displayIssues(result) {
     };
 
     issuesHtml += renderIssueSection(
-        'issue-diff-items',
-        '差异项 - 一方完全不存在',
-        result.summary?.diff_items_display_count ?? result.diff_items?.length ?? 0,
-        result.diff_items,
+        'issue-diff-vendor-only',
+        '仅供应商',
+        vendorOnlyWithReason.length,
+        vendorOnlyWithReason,
         'badge-danger',
-        '差异项'
+        '仅供应商'
+    );
+    issuesHtml += renderIssueSection(
+        'issue-diff-internal-only',
+        '仅入库单',
+        internalOnlyWithReason.length,
+        internalOnlyWithReason,
+        'badge-danger',
+        '仅入库单'
     );
     issuesHtml += renderIssueSection(
         'issue-diff-qty',
-        '数量差异 - PO+物料编码匹配，数量不一致',
+        '数量差异',
         result.summary?.diff_qty_display_count ?? result.diff_qty?.length ?? 0,
         result.diff_qty,
         'badge-warning',
@@ -701,7 +813,7 @@ function displayIssues(result) {
     );
     issuesHtml += renderIssueSection(
         'issue-diff-price',
-        '单价差异 - PO+物料编码匹配，单价不一致',
+        '单价差异',
         result.summary?.diff_price_display_count ?? result.diff_price?.length ?? 0,
         result.diff_price,
         'badge-warning',
@@ -709,7 +821,7 @@ function displayIssues(result) {
     );
     issuesHtml += renderIssueSection(
         'issue-diff-amount',
-        '金额差异 - PO+物料编码+数量+单价匹配，金额不一致',
+        '金额差异',
         result.summary?.diff_amount_display_count ?? result.diff_amount?.length ?? 0,
         result.diff_amount,
         'badge-warning',

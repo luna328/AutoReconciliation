@@ -236,6 +236,20 @@
         <p>正在处理中...</p>
     </div>
 
+    <div class="usage-modal-backdrop" id="usage-modal-backdrop"></div>
+    <div class="usage-modal" id="usage-modal" role="dialog" aria-modal="true" aria-labelledby="usage-modal-title">
+        <h3 id="usage-modal-title"></h3>
+        <ul id="usage-modal-steps"></ul>
+        <p class="usage-contact" id="usage-modal-contact"></p>
+        <div class="usage-modal-footer">
+            <label class="usage-skip-label" for="usage-modal-skip-today">
+                <input type="checkbox" id="usage-modal-skip-today">
+                <span id="usage-modal-skip-text">今日不再提醒</span>
+            </label>
+            <button class="btn-primary usage-confirm-btn" id="usage-modal-confirm" type="button">我知道了</button>
+        </div>
+    </div>
+
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
