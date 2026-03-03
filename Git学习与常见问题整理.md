@@ -375,6 +375,83 @@ Git 无法判断“该保留哪边”时，就会停下来让你手工决定。
 
 ---
 
+## 8.1 Git、Git Bash、GitHub 三者关系
+
+这三个名字容易混淆，可以这样记：
+
+- **Git**：版本控制工具本体（`add/commit/push` 都是它的命令）。
+- **GitHub**：托管 Git 仓库的远程平台（代码托管、PR、Issue、协作）。
+- **Git Bash**：Windows 上常用的命令行环境，方便执行 Git 和 Bash 命令。
+
+关系图：
+
+```text
+你（在终端输入命令）
+        |
+        v
+      Git（本地版本管理）
+        |
+        v
+   GitHub（远程协作平台）
+```
+
+说明：
+- 你不一定必须用 Git Bash，也可用 PowerShell/CMD；
+- 关键是系统里要安装 Git，终端只是执行入口。
+
+---
+
+## 8.2 使用 Git 命令行的前提条件
+
+使用 Git 命令前，最小前提有 3 个：
+
+1. 电脑已安装 Git（Windows 常装 Git for Windows）。
+2. 打开终端（Git Bash / PowerShell / CMD 均可）。
+3. 当前目录是 Git 仓库，或先初始化/克隆仓库。
+
+### 快速检查步骤
+
+1) 验证 Git 是否安装
+
+```bash
+git --version
+```
+
+2) 首次配置身份（只需一次）
+
+```bash
+git config --global user.name "你的名字"
+git config --global user.email "你的邮箱"
+```
+
+3) 准备仓库
+
+- 新建仓库：
+
+```bash
+git init
+```
+
+- 克隆远程仓库：
+
+```bash
+git clone <仓库地址>
+```
+
+4) 日常最小流程
+
+```bash
+git status
+git add .
+git commit -m "feat: xxx"
+git push
+```
+
+一句话：
+**先安装 Git，再进入仓库目录，就能在终端使用 Git 命令。**
+
+---
+
 ## 9. 一句话总复盘
 
 你当前最关键认知已经建立：
