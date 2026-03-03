@@ -109,6 +109,39 @@ FOOTER_KEYWORDS = [
     "Total",
 ]
 
+# 系统入库单表尾识别规则（强/弱关键词分层）
+INTERNAL_FOOTER_STRONG_KEYWORDS = [
+    "合计",
+    "总计",
+    "小计",
+    "累计",
+    "本页合计",
+    "本月合计",
+    "grand total",
+    "total",
+    "sum",
+]
+INTERNAL_FOOTER_WEAK_KEYWORDS = [
+    "备注",
+    "说明",
+    "签字",
+    "签章",
+    "审核",
+    "制表",
+    "复核",
+    "结存",
+]
+INTERNAL_PAGE_FOOTER_KEYWORDS = [
+    "第",
+    "页",
+    "共",
+    "page",
+    "of",
+    "打印时间",
+    "报表日期",
+    "导出人",
+]
+
 
 def _to_text(v):
     if pd.isna(v):
@@ -128,6 +161,257 @@ def _to_float(v):
         return float(s)
     except ValueError:
         return None
+
+
+def _contains_any(text, keywords):
+    t = _to_text(text).lower()
+    if not t:
+        return False
+    return any(k.lower() in t for k in (keywords or []))
+
+
+def _is_internal_repeated_header_row(row_vals, columns):
+    """规则7：重复表头检测（多页拼接场景）"""
+    if not columns:
+        return False
+    row_texts = [_to_text(v).lower() for v in row_vals]
+    col_texts = [_to_text(c).lower() for c in columns]
+    if not any(row_texts):
+        return False
+
+    hit = 0
+    for rt in row_texts:
+        if rt and rt in col_texts:
+            hit += 1
+
+    threshold = max(2, int(len(col_texts) * 0.4))
+    return hit >= threshold
+
+
+def _pick_internal_candidate_columns(df):
+    cols = [str(c) for c in df.columns]
+    po_cols = [
+        c for c in cols if any(k in c.lower() for k in ["po", "订单", "采购", "单号"])
+    ]
+    item_cols = [
+        c
+        for c in cols
+        if any(
+            k in c.lower()
+            for k in ["物料", "item", "sku", "料号", "货号", "part", "pn", "编码"]
+        )
+    ]
+    amount_cols = [
+        c
+        for c in cols
+        if any(k in c.lower() for k in ["金额", "合计", "amount", "total"])
+    ]
+
+    numeric_cols = []
+    sample = df.head(200)
+    for c in cols:
+        vals = sample[c].tolist()
+        nums = sum(1 for v in vals if _to_float(v) is not None)
+        ratio = nums / max(len(vals), 1)
+        if ratio >= 0.45:
+            numeric_cols.append(c)
+
+    return {
+        "po_col": po_cols[0] if po_cols else None,
+        "item_col": item_cols[0] if item_cols else None,
+        "amount_col": amount_cols[0] if amount_cols else None,
+        "numeric_cols": numeric_cols,
+    }
+
+
+def _is_internal_detail_row(row, candidates):
+    """内部明细行特征：PO+物料至少一个成立，且有数值列支撑。"""
+    po_col = candidates.get("po_col")
+    item_col = candidates.get("item_col")
+    numeric_cols = candidates.get("numeric_cols", [])
+
+    po_text = _to_text(row.get(po_col)) if po_col else ""
+    item_text = _to_text(row.get(item_col)) if item_col else ""
+
+    po_like = bool(po_text) and (_is_po(po_text) or len(po_text) >= 4)
+    item_like = bool(item_text) and (_is_item(item_text) or len(item_text) >= 4)
+
+    numeric_hits = 0
+    for c in numeric_cols:
+        if _to_float(row.get(c)) is not None:
+            numeric_hits += 1
+
+    # 防护：优先要求行具备“业务键+数值”结构，不因纯文本误判
+    return (po_like or item_like) and numeric_hits >= 1
+
+
+def detect_internal_footer_cutoff(df):
+    """
+    系统入库单表尾识别（8条规则+防护策略）
+    返回: (cutoff_index_exclusive, meta)
+    """
+    if df is None or len(df) == 0:
+        return 0, {"detected": False, "reason": "empty"}
+
+    cols = [str(c) for c in df.columns]
+    if not cols:
+        return len(df), {"detected": False, "reason": "no_columns"}
+
+    candidates = _pick_internal_candidate_columns(df)
+
+    # 防护策略：先进入明细区，再允许触发表尾截断
+    detail_start = None
+    for i in range(min(len(df), 300)):
+        row = df.iloc[i]
+        if _is_internal_detail_row(row, candidates):
+            detail_start = i
+            break
+
+    if detail_start is None:
+        return len(df), {"detected": False, "reason": "no_detail_start"}
+
+    min_detail_rows = 5  # 防护策略：最小明细行数保护
+    detail_rows_seen = 0
+
+    non_detail_streak = 0
+    low_density_streak = 0
+    type_drift_streak = 0
+
+    amount_col = candidates.get("amount_col")
+    running_amount_sum = 0.0
+
+    for idx in range(detail_start, len(df)):
+        row = df.iloc[idx]
+        row_vals = row.tolist()
+        row_texts = [_to_text(v) for v in row_vals if _to_text(v)]
+        all_text = " ".join(row_texts).lower()
+        first_cell = _to_text(row_vals[0] if row_vals else "")
+
+        is_detail = _is_internal_detail_row(row, candidates)
+        if is_detail:
+            detail_rows_seen += 1
+            non_detail_streak = 0
+        else:
+            non_detail_streak += 1
+
+        # 规则4：空白密度
+        non_empty_ratio = len(row_texts) / max(len(cols), 1)
+        if non_empty_ratio < 0.2:
+            low_density_streak += 1
+        else:
+            low_density_streak = 0
+
+        # 规则5：字段类型漂移（数值结构突然消失）
+        numeric_hits = 0
+        for c in candidates.get("numeric_cols", []):
+            if _to_float(row.get(c)) is not None:
+                numeric_hits += 1
+        if not is_detail and numeric_hits == 0 and len(row_texts) >= 2:
+            type_drift_streak += 1
+        else:
+            type_drift_streak = 0
+
+        # 规则8：金额校验辅助（可选增信）
+        amount_checksum_like = False
+        amount_tol = 0.05
+        if amount_col and is_detail:
+            av = _to_float(row.get(amount_col))
+            if av is not None:
+                running_amount_sum += av
+        elif amount_col and not is_detail:
+            av = _to_float(row.get(amount_col))
+            if av is not None and detail_rows_seen >= 1:
+                if abs(av - running_amount_sum) <= amount_tol:
+                    amount_checksum_like = True
+
+        strong_kw = _contains_any(all_text, INTERNAL_FOOTER_STRONG_KEYWORDS)
+        weak_kw = _contains_any(all_text, INTERNAL_FOOTER_WEAK_KEYWORDS)
+
+        # 规则6：页脚/分页标识
+        page_kw = (
+            ("第" in all_text and "页" in all_text and "共" in all_text)
+            or ("page" in all_text and "of" in all_text)
+            or _contains_any(all_text, INTERNAL_PAGE_FOOTER_KEYWORDS)
+        )
+
+        # 规则2：首列语义
+        first_col_footer_kw = _contains_any(
+            first_cell, INTERNAL_FOOTER_STRONG_KEYWORDS
+        ) or _contains_any(first_cell, INTERNAL_FOOTER_WEAK_KEYWORDS)
+
+        # 规则7：重复表头
+        repeated_header = _is_internal_repeated_header_row(row_vals, cols)
+
+        can_cut_normally = detail_rows_seen >= min_detail_rows
+        can_cut_hard = detail_rows_seen >= 1
+
+        # 规则1：强关键词（高优先级硬规则）
+        if strong_kw and can_cut_hard and (can_cut_normally or not is_detail):
+            return idx, {
+                "detected": True,
+                "reason": "rule1_strong_keyword",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则6：页脚信息（高优先级硬规则）
+        if page_kw and can_cut_hard and (can_cut_normally or not is_detail):
+            return idx, {
+                "detected": True,
+                "reason": "rule6_page_footer",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则2：首列语义（高优先级硬规则）
+        if (
+            first_col_footer_kw
+            and can_cut_hard
+            and (can_cut_normally or non_detail_streak >= 1)
+        ):
+            return idx, {
+                "detected": True,
+                "reason": "rule2_first_col_footer",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则7：重复表头（中高优先）
+        if repeated_header and can_cut_normally and non_detail_streak >= 1:
+            return idx, {
+                "detected": True,
+                "reason": "rule7_repeated_header",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则3/4/5/8 + 弱关键词（软规则评分）
+        soft_score = 0
+        if non_detail_streak >= 3:  # 规则3
+            soft_score += 2
+        if low_density_streak >= 2:  # 规则4
+            soft_score += 1
+        if type_drift_streak >= 2:  # 规则5
+            soft_score += 1
+        if weak_kw and non_detail_streak >= 1:  # 弱关键词仅在结构断裂时生效
+            soft_score += 1
+        if amount_checksum_like:  # 规则8
+            soft_score += 2
+
+        if can_cut_normally and soft_score >= 3:
+            return idx, {
+                "detected": True,
+                "reason": "soft_rules_score",
+                "score": soft_score,
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+    return len(df), {
+        "detected": False,
+        "reason": "no_footer_detected",
+        "detail_start": detail_start,
+    }
 
 
 def _is_po(v):
@@ -696,12 +980,12 @@ def upload_internal_file():
         df = pd.read_excel(filepath)
         df.columns = [str(col) for col in df.columns]
 
-        # 固定规则：第一列出现“合计”的行剔除，避免纳入对账
-        if len(df.columns) > 0:
-            first_col = df.columns[0]
-            mask_total = df[first_col].astype(str).str.contains("合计", na=False)
-            if mask_total.any():
-                df = df.loc[~mask_total].reset_index(drop=True)
+        # 更通用规则：8条规则+防护策略定位系统入库单表尾
+        cutoff, footer_meta = detect_internal_footer_cutoff(df)
+        if cutoff < len(df):
+            df = df.iloc[:cutoff].reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
 
         # 保存数据
         current_task["internal_file"] = filepath
@@ -730,6 +1014,7 @@ def upload_internal_file():
                 "row_count": len(df),
                 "columns": columns,
                 "preview": preview,
+                "footer_detection": footer_meta,
             }
         )
 
