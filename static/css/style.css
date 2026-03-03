@@ -1086,6 +1086,24 @@ footer {
         transition: transform 0.25s ease;
     }
 
+    .app-shell.sidebar-collapsed {
+        grid-template-columns: 1fr;
+    }
+
+    .app-shell.sidebar-collapsed .brand-text,
+    .app-shell.sidebar-collapsed .side-link em {
+        display: block;
+    }
+
+    .app-shell.sidebar-collapsed .side-link {
+        justify-content: flex-start;
+        padding-inline: 12px;
+    }
+
+    .sidebar-toggle {
+        display: none;
+    }
+
     .app-shell.sidebar-opened .sidebar {
         transform: translateX(0);
     }
