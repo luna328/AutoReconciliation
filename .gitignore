@@ -13,6 +13,7 @@ __pycache__/
 uploads/
 *.log
 *.tmp
+.env
 
 # Local test data and scratch files
 test/
