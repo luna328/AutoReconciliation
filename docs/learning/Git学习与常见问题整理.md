@@ -509,3 +509,43 @@ refactor: 抽取表尾识别公共函数
 - Git 负责发现冲突
 - 你负责按业务语义裁决冲突
 - 裁决后再 add/commit/push 完成闭环
+
+---
+
+## 10. 可不可以只 commit 部分文件？push 是不是会推全部文件？
+
+这个问题非常关键，结论如下：
+
+1. **可以只 commit 部分文件**
+   - commit 只会记录“暂存区（staging area）”里的改动。
+   - 你 `git add` 哪些文件，本次 commit 就包含哪些文件。
+   - 没有被 `git add` 的改动，不会进入这次 commit。
+
+2. **`git add .` 不是 commit**
+   - `git add .` 的作用是“把改动加入暂存区”。
+   - 只有执行 `git commit` 后，才会形成新的版本提交。
+
+3. **push 推的是 commit 历史，不是整盘文件强制覆盖**
+   - `git push` 上传的是“本地分支比远程分支多出的 commit”。
+   - 如果某些改动没被 commit，那么即使你 push，也不会上传这些改动。
+
+### 10.1 示例：只提交两个文件
+
+```bash
+git status
+git add docs/learning/Git学习与常见问题整理.md tests/test_sql_crud_behavior.py
+git commit -m "docs: 补充Git与SQL学习说明"
+git push origin main
+```
+
+上面这次提交只包含这两个文件；其他未暂存改动仍留在本地工作区。
+
+### 10.2 如果不小心 `git add .` 了怎么办
+
+可以把不想提交的文件从暂存区撤回：
+
+```bash
+git restore --staged <file>
+```
+
+然后重新 `git status` 检查，确认暂存区内容正确，再 commit。
