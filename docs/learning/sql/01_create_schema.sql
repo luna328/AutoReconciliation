@@ -1,0 +1,28 @@
+CREATE TABLE IF NOT EXISTS reconcile_task (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_name VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'created',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS upload_record (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_id BIGINT NOT NULL,
+    file_type VARCHAR(20) NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+    uploaded_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_upload_task
+        FOREIGN KEY (task_id) REFERENCES reconcile_task(id)
+        ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS reconcile_result (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    task_id BIGINT NOT NULL,
+    result_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    diff_count INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_result_task UNIQUE (task_id),
+    CONSTRAINT fk_result_task
+        FOREIGN KEY (task_id) REFERENCES reconcile_task(id)
+        ON DELETE CASCADE
+);
