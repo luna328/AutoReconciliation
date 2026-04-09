@@ -1,0 +1,25 @@
+# Python virtual env and caches
+.venv/
+venv/
+__pycache__/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+*.pyo
+*.pyd
+
+# Local runtime artifacts
+uploads/
+*.log
+*.tmp
+.env
+
+# Local test data and scratch files
+test/
+
+# Editor and OS files
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

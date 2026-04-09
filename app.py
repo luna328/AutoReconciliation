@@ -1,0 +1,2181 @@
+from flask import Flask, render_template, request, jsonify, send_file
+import pandas as pd
+import numpy as np
+import os
+import json
+import math
+import re
+from datetime import datetime, timedelta
+from werkzeug.utils import secure_filename
+import io
+from uuid import uuid4
+
+from dotenv import load_dotenv
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import UniqueConstraint
+
+
+def clean_nan(value):
+    """清理NaN值，用于JSON序列化"""
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    return value
+
+
+def clean_dict(data):
+    """递归清理字典中的NaN值"""
+    if isinstance(data, dict):
+        return {k: clean_dict(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [clean_dict(item) for item in data]
+    else:
+        return clean_nan(data)
+
+
+class ValidationError(Exception):
+    def __init__(self, message, code="VALIDATION_ERROR", details=None, status=400):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.details = details or {}
+        self.status = status
+
+
+load_dotenv()
+app = Flask(__name__)
+app.json.sort_keys = False
+app.config["UPLOAD_FOLDER"] = "uploads"
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max file size
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///reconciliation.db"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# 确保上传目录存在
+os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+
+
+class ReconcileTask(db.Model):
+    __tablename__ = "reconcile_task"
+
+    id = db.Column(db.String(36), primary_key=True)
+    status = db.Column(db.String(20), nullable=False, default="created")
+    error_message = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+    uploads = db.relationship(
+        "UploadRecord",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+    result = db.relationship(
+        "ReconcileResult",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy=True,
+    )
+
+
+class UploadRecord(db.Model):
+    __tablename__ = "upload_record"
+    __table_args__ = (
+        UniqueConstraint("task_id", "file_type", name="uq_upload_task_file_type"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    task_id = db.Column(db.String(36), db.ForeignKey("reconcile_task.id"), nullable=False)
+    file_type = db.Column(db.String(20), nullable=False)
+    file_name = db.Column(db.String(255), nullable=False)
+    saved_path = db.Column(db.String(512), nullable=False)
+    row_count = db.Column(db.Integer, nullable=False, default=0)
+    columns_json = db.Column(db.Text, nullable=False, default="[]")
+    preview_json = db.Column(db.Text, nullable=False, default="[]")
+    extra_json = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+    task = db.relationship("ReconcileTask", back_populates="uploads")
+
+
+class ReconcileResult(db.Model):
+    __tablename__ = "reconcile_result"
+    __table_args__ = (UniqueConstraint("task_id", name="uq_result_task"),)
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    task_id = db.Column(db.String(36), db.ForeignKey("reconcile_task.id"), nullable=False)
+    summary_json = db.Column(db.Text, nullable=False, default="{}")
+    result_json = db.Column(db.Text, nullable=False, default="{}")
+    mapping_json = db.Column(db.Text, nullable=False, default="{}")
+    tolerance_json = db.Column(db.Text, nullable=False, default="{}")
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+    task = db.relationship("ReconcileTask", back_populates="result")
+
+
+with app.app_context():
+    try:
+        db.create_all()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("数据库初始化失败，task_id 持久化功能暂不可用")
+
+
+def _json_dumps(data):
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _json_loads(data, fallback):
+    if not data:
+        return fallback
+    try:
+        return json.loads(data)
+    except Exception:
+        return fallback
+
+
+def error_response(message, code="BAD_REQUEST", status=400, **kwargs):
+    payload = {"success": False, "error": message, "code": code}
+    payload.update(kwargs)
+    return jsonify(payload), status
+
+
+def _allowed_excel(filename):
+    return bool(filename) and filename.lower().endswith((".xlsx", ".xls"))
+
+
+def _new_upload_filename(prefix):
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.xlsx"
+
+
+# 全局变量存储当前任务数据
+current_task = {
+    "vendor_file": None,
+    "internal_file": None,
+    "vendor_data": None,
+    "internal_data": None,
+    "result": None,
+}
+
+DEFAULT_PO_PATTERN = r"^LY20\d{6,}$"
+DEFAULT_ITEM_PATTERN = r"^(BC\d{5,}|ASE[0-9A-Z-]{3,})$"
+
+VENDOR_TEMPLATES = [
+    {
+        "name": "legacy_ly",
+        "filename_keywords": ["ly", "lianying", "联赢"],
+        "po_patterns": [DEFAULT_PO_PATTERN],
+        "item_patterns": [DEFAULT_ITEM_PATTERN],
+        "po_headers": ["po", "订单号", "订单号码", "订单单号", "采购单号", "po号"],
+        "item_headers": ["物料编码", "物料号", "料号", "item", "sku", "part"],
+    },
+    {
+        "name": "generic",
+        "filename_keywords": [],
+        "po_patterns": [
+            r"^PO[-_ ]?[A-Z0-9]{4,}$",
+            r"^[A-Z]{1,4}[-_ ]?\d{6,}$",
+            r"^\d{8,}$",
+        ],
+        "item_patterns": [
+            r"^[A-Z0-9][A-Z0-9._/-]{4,}$",
+            r"^\d{5,}$",
+        ],
+        "po_headers": ["po", "订单号", "订单号码", "订单单号", "采购单号", "po号"],
+        "item_headers": [
+            "物料编码",
+            "物料号",
+            "料号",
+            "货号",
+            "item",
+            "sku",
+            "part",
+            "pn",
+            "material",
+        ],
+    },
+]
+
+ALL_PO_PATTERNS = [
+    DEFAULT_PO_PATTERN,
+    r"^PO[-_ ]?[A-Z0-9]{4,}$",
+    r"^[A-Z]{1,4}[-_ ]?\d{6,}$",
+    r"^\d{8,}$",
+]
+ALL_ITEM_PATTERNS = [
+    DEFAULT_ITEM_PATTERN,
+    r"^[A-Z0-9][A-Z0-9._/-]{4,}$",
+    r"^\d{5,}$",
+]
+
+PO_REGEXES = [re.compile(p, re.IGNORECASE) for p in ALL_PO_PATTERNS]
+ITEM_REGEXES = [re.compile(p, re.IGNORECASE) for p in ALL_ITEM_PATTERNS]
+FOOTER_KEYWORDS = [
+    "合计",
+    "总计",
+    "小计",
+    "本月合计",
+    "金额合计",
+    "累计",
+    "TOTAL",
+    "Total",
+]
+
+# 系统入库单表尾识别规则（强/弱关键词分层）
+INTERNAL_FOOTER_STRONG_KEYWORDS = [
+    "合计",
+    "总计",
+    "小计",
+    "累计",
+    "本页合计",
+    "本月合计",
+    "grand total",
+    "total",
+    "sum",
+]
+INTERNAL_FOOTER_WEAK_KEYWORDS = [
+    "备注",
+    "说明",
+    "签字",
+    "签章",
+    "审核",
+    "制表",
+    "复核",
+    "结存",
+]
+INTERNAL_PAGE_FOOTER_KEYWORDS = [
+    "第",
+    "页",
+    "共",
+    "page",
+    "of",
+    "打印时间",
+    "报表日期",
+    "导出人",
+]
+
+
+def _to_text(v):
+    if pd.isna(v):
+        return ""
+    return str(v).strip()
+
+
+def _to_float(v):
+    if pd.isna(v):
+        return None
+    if isinstance(v, (int, float, np.number)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _contains_any(text, keywords):
+    t = _to_text(text).lower()
+    if not t:
+        return False
+    return any(k.lower() in t for k in (keywords or []))
+
+
+def _build_preview(df):
+    preview_df = df.head(10).copy()
+    preview = []
+    for record in preview_df.to_dict("records"):
+        cleaned_record = {}
+        for k, v in record.items():
+            key = str(k)
+            if pd.isna(v):
+                cleaned_record[key] = ""
+            elif isinstance(v, (pd.Timestamp, datetime)):
+                cleaned_record[key] = str(v)
+            else:
+                cleaned_record[key] = v
+        preview.append(cleaned_record)
+    return preview
+
+
+def _cleanup_uploads():
+    """按天数清理 uploads 目录，保留进行中任务引用文件。"""
+    retention_days = int(os.environ.get("UPLOAD_RETENTION_DAYS", "7"))
+    if retention_days <= 0:
+        return
+
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    active_paths = set()
+    try:
+        active_records = (
+            db.session.query(UploadRecord.saved_path)
+            .join(ReconcileTask, ReconcileTask.id == UploadRecord.task_id)
+            .filter(ReconcileTask.status.in_(["created", "uploaded"]))
+            .all()
+        )
+    except Exception:
+        db.session.rollback()
+        app.logger.warning("读取上传文件引用失败，跳过活动文件保护")
+        active_records = []
+    for row in active_records:
+        if row[0]:
+            active_paths.add(os.path.abspath(row[0]))
+
+    for entry in os.scandir(app.config["UPLOAD_FOLDER"]):
+        if not entry.is_file():
+            continue
+        abs_path = os.path.abspath(entry.path)
+        if abs_path in active_paths:
+            continue
+        modified = datetime.fromtimestamp(entry.stat().st_mtime)
+        if modified < cutoff:
+            try:
+                os.remove(abs_path)
+            except OSError:
+                app.logger.warning("上传文件清理失败: %s", abs_path)
+
+
+def _parse_qty_strict(series, row_series, side):
+    parsed = []
+    errors = []
+
+    for idx, raw in enumerate(series.tolist()):
+        row_no = int(row_series.iloc[idx]) if idx < len(row_series) else idx + 1
+        if pd.isna(raw) or str(raw).strip() == "":
+            errors.append(
+                {
+                    "side": side,
+                    "row_no": row_no,
+                    "value": None if pd.isna(raw) else str(raw),
+                    "reason": "数量不能为空",
+                }
+            )
+            parsed.append(None)
+            continue
+
+        num = _to_float(raw)
+        if num is None:
+            errors.append(
+                {
+                    "side": side,
+                    "row_no": row_no,
+                    "value": str(raw),
+                    "reason": "数量必须是数字",
+                }
+            )
+            parsed.append(None)
+            continue
+
+        if abs(num - round(num)) > 1e-9:
+            errors.append(
+                {
+                    "side": side,
+                    "row_no": row_no,
+                    "value": str(raw),
+                    "reason": "数量必须为整数",
+                }
+            )
+            parsed.append(None)
+            continue
+
+        parsed.append(int(round(num)))
+
+    return pd.Series(parsed, dtype="Int64"), errors
+
+
+def _ensure_required_mapping(mapping, required_keys, df_columns, side):
+    mapping = mapping or {}
+    missing_fields = [k for k in required_keys if not _to_text(mapping.get(k))]
+    if missing_fields:
+        raise ValidationError(
+            f"{side}映射缺少必填字段",
+            code="MISSING_MAPPING_FIELDS",
+            details={"side": side, "missing_fields": missing_fields},
+            status=400,
+        )
+
+    missing_columns = []
+    for key in required_keys:
+        column_name = _to_text(mapping.get(key))
+        if column_name not in df_columns:
+            missing_columns.append({"field": key, "column": column_name})
+
+    if missing_columns:
+        raise ValidationError(
+            f"{side}映射列不存在",
+            code="MAPPING_COLUMN_NOT_FOUND",
+            details={"side": side, "missing_columns": missing_columns},
+            status=400,
+        )
+
+
+def _read_vendor_data(filepath, vendor_hint=""):
+    raw_df = pd.read_excel(filepath, header=None)
+    df, suggested = detect_vendor_table_and_mapping(raw_df, vendor_hint)
+    if df is None or len(df) == 0:
+        df = pd.read_excel(filepath, header=4)
+        df = df.dropna(how="all", axis=1)
+        df.columns = [str(col) for col in df.columns]
+        suggested = {}
+    return df, suggested
+
+
+def _read_internal_data(filepath):
+    df = pd.read_excel(filepath)
+    df.columns = [str(c) for c in df.columns]
+    cutoff, footer_meta = detect_internal_footer_cutoff(df)
+    if cutoff < len(df):
+        df = df.iloc[:cutoff].reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
+    return df, footer_meta
+
+
+def _upsert_upload_record(
+    task,
+    file_type,
+    original_name,
+    filepath,
+    df,
+    preview,
+    extra=None,
+):
+    record = UploadRecord.query.filter_by(task_id=task.id, file_type=file_type).first()
+    if record is None:
+        record = UploadRecord(task_id=task.id, file_type=file_type)
+        db.session.add(record)
+
+    record.file_name = original_name
+    record.saved_path = filepath
+    record.row_count = int(len(df))
+    record.columns_json = _json_dumps(df.columns.tolist())
+    record.preview_json = _json_dumps(preview)
+    record.extra_json = _json_dumps(extra) if extra else None
+
+    has_vendor = file_type == "vendor" or (
+        UploadRecord.query.filter_by(task_id=task.id, file_type="vendor").first()
+        is not None
+    )
+    has_internal = file_type == "internal" or (
+        UploadRecord.query.filter_by(task_id=task.id, file_type="internal").first()
+        is not None
+    )
+    task.status = "uploaded" if has_vendor and has_internal else "created"
+
+
+def _get_task_or_error(task_id):
+    if not _to_text(task_id):
+        return None
+    return ReconcileTask.query.filter_by(id=task_id).first()
+
+
+def _is_internal_repeated_header_row(row_vals, columns):
+    """规则7：重复表头检测（多页拼接场景）"""
+    if not columns:
+        return False
+    row_texts = [_to_text(v).lower() for v in row_vals]
+    col_texts = [_to_text(c).lower() for c in columns]
+    if not any(row_texts):
+        return False
+
+    hit = 0
+    for rt in row_texts:
+        if rt and rt in col_texts:
+            hit += 1
+
+    threshold = max(2, int(len(col_texts) * 0.4))
+    return hit >= threshold
+
+
+def _pick_internal_candidate_columns(df):
+    cols = [str(c) for c in df.columns]
+    po_cols = [
+        c for c in cols if any(k in c.lower() for k in ["po", "订单", "采购", "单号"])
+    ]
+    item_cols = [
+        c
+        for c in cols
+        if any(
+            k in c.lower()
+            for k in ["物料", "item", "sku", "料号", "货号", "part", "pn", "编码"]
+        )
+    ]
+    amount_cols = [
+        c
+        for c in cols
+        if any(k in c.lower() for k in ["金额", "合计", "amount", "total"])
+    ]
+
+    numeric_cols = []
+    sample = df.head(200)
+    for c in cols:
+        vals = sample[c].tolist()
+        nums = sum(1 for v in vals if _to_float(v) is not None)
+        ratio = nums / max(len(vals), 1)
+        if ratio >= 0.45:
+            numeric_cols.append(c)
+
+    return {
+        "po_col": po_cols[0] if po_cols else None,
+        "item_col": item_cols[0] if item_cols else None,
+        "amount_col": amount_cols[0] if amount_cols else None,
+        "numeric_cols": numeric_cols,
+    }
+
+
+def _is_internal_detail_row(row, candidates):
+    """内部明细行特征：PO+物料至少一个成立，且有数值列支撑。"""
+    po_col = candidates.get("po_col")
+    item_col = candidates.get("item_col")
+    numeric_cols = candidates.get("numeric_cols", [])
+
+    po_text = _to_text(row.get(po_col)) if po_col else ""
+    item_text = _to_text(row.get(item_col)) if item_col else ""
+
+    po_like = bool(po_text) and (_is_po(po_text) or len(po_text) >= 4)
+    item_like = bool(item_text) and (_is_item(item_text) or len(item_text) >= 4)
+
+    numeric_hits = 0
+    for c in numeric_cols:
+        if _to_float(row.get(c)) is not None:
+            numeric_hits += 1
+
+    # 防护：优先要求行具备“业务键+数值”结构，不因纯文本误判
+    return (po_like or item_like) and numeric_hits >= 1
+
+
+def detect_internal_footer_cutoff(df):
+    """
+    系统入库单表尾识别（8条规则+防护策略）
+    返回: (cutoff_index_exclusive, meta)
+    """
+    if df is None or len(df) == 0:
+        return 0, {"detected": False, "reason": "empty"}
+
+    cols = [str(c) for c in df.columns]
+    if not cols:
+        return len(df), {"detected": False, "reason": "no_columns"}
+
+    candidates = _pick_internal_candidate_columns(df)
+
+    # 防护策略：先进入明细区，再允许触发表尾截断
+    detail_start = None
+    for i in range(min(len(df), 300)):
+        row = df.iloc[i]
+        if _is_internal_detail_row(row, candidates):
+            detail_start = i
+            break
+
+    if detail_start is None:
+        return len(df), {"detected": False, "reason": "no_detail_start"}
+
+    min_detail_rows = 5  # 防护策略：最小明细行数保护
+    detail_rows_seen = 0
+
+    non_detail_streak = 0
+    low_density_streak = 0
+    type_drift_streak = 0
+
+    amount_col = candidates.get("amount_col")
+    running_amount_sum = 0.0
+
+    for idx in range(detail_start, len(df)):
+        row = df.iloc[idx]
+        row_vals = row.tolist()
+        row_texts = [_to_text(v) for v in row_vals if _to_text(v)]
+        all_text = " ".join(row_texts).lower()
+        first_cell = _to_text(row_vals[0] if row_vals else "")
+
+        is_detail = _is_internal_detail_row(row, candidates)
+        if is_detail:
+            detail_rows_seen += 1
+            non_detail_streak = 0
+        else:
+            non_detail_streak += 1
+
+        # 规则4：空白密度
+        non_empty_ratio = len(row_texts) / max(len(cols), 1)
+        if non_empty_ratio < 0.2:
+            low_density_streak += 1
+        else:
+            low_density_streak = 0
+
+        # 规则5：字段类型漂移（数值结构突然消失）
+        numeric_hits = 0
+        for c in candidates.get("numeric_cols", []):
+            if _to_float(row.get(c)) is not None:
+                numeric_hits += 1
+        if not is_detail and numeric_hits == 0 and len(row_texts) >= 2:
+            type_drift_streak += 1
+        else:
+            type_drift_streak = 0
+
+        # 规则8：金额校验辅助（可选增信）
+        amount_checksum_like = False
+        amount_tol = 0.05
+        if amount_col and is_detail:
+            av = _to_float(row.get(amount_col))
+            if av is not None:
+                running_amount_sum += av
+        elif amount_col and not is_detail:
+            av = _to_float(row.get(amount_col))
+            if av is not None and detail_rows_seen >= 1:
+                if abs(av - running_amount_sum) <= amount_tol:
+                    amount_checksum_like = True
+
+        strong_kw = _contains_any(all_text, INTERNAL_FOOTER_STRONG_KEYWORDS)
+        weak_kw = _contains_any(all_text, INTERNAL_FOOTER_WEAK_KEYWORDS)
+
+        # 规则6：页脚/分页标识
+        page_kw = (
+            ("第" in all_text and "页" in all_text and "共" in all_text)
+            or ("page" in all_text and "of" in all_text)
+            or _contains_any(all_text, INTERNAL_PAGE_FOOTER_KEYWORDS)
+        )
+
+        # 规则2：首列语义
+        first_col_footer_kw = _contains_any(
+            first_cell, INTERNAL_FOOTER_STRONG_KEYWORDS
+        ) or _contains_any(first_cell, INTERNAL_FOOTER_WEAK_KEYWORDS)
+
+        # 规则7：重复表头
+        repeated_header = _is_internal_repeated_header_row(row_vals, cols)
+
+        can_cut_normally = detail_rows_seen >= min_detail_rows
+        can_cut_hard = detail_rows_seen >= 1
+
+        # 规则1：强关键词（高优先级硬规则）
+        if strong_kw and can_cut_hard and (can_cut_normally or not is_detail):
+            return idx, {
+                "detected": True,
+                "reason": "rule1_strong_keyword",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则6：页脚信息（高优先级硬规则）
+        if page_kw and can_cut_hard and (can_cut_normally or not is_detail):
+            return idx, {
+                "detected": True,
+                "reason": "rule6_page_footer",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则2：首列语义（高优先级硬规则）
+        if (
+            first_col_footer_kw
+            and can_cut_hard
+            and (can_cut_normally or non_detail_streak >= 1)
+        ):
+            return idx, {
+                "detected": True,
+                "reason": "rule2_first_col_footer",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则7：重复表头（中高优先）
+        if repeated_header and can_cut_normally and non_detail_streak >= 1:
+            return idx, {
+                "detected": True,
+                "reason": "rule7_repeated_header",
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+        # 规则3/4/5/8 + 弱关键词（软规则评分）
+        soft_score = 0
+        if non_detail_streak >= 3:  # 规则3
+            soft_score += 2
+        if low_density_streak >= 2:  # 规则4
+            soft_score += 1
+        if type_drift_streak >= 2:  # 规则5
+            soft_score += 1
+        if weak_kw and non_detail_streak >= 1:  # 弱关键词仅在结构断裂时生效
+            soft_score += 1
+        if amount_checksum_like:  # 规则8
+            soft_score += 2
+
+        if can_cut_normally and soft_score >= 3:
+            return idx, {
+                "detected": True,
+                "reason": "soft_rules_score",
+                "score": soft_score,
+                "detail_start": detail_start,
+                "cutoff_row": idx,
+            }
+
+    return len(df), {
+        "detected": False,
+        "reason": "no_footer_detected",
+        "detail_start": detail_start,
+    }
+
+
+def _is_po(v):
+    text = _to_text(v)
+    return any(r.match(text) for r in PO_REGEXES)
+
+
+def _is_item(v):
+    text = _to_text(v)
+    return any(r.match(text) for r in ITEM_REGEXES)
+
+
+def _compile_patterns(patterns):
+    return [re.compile(p, re.IGNORECASE) for p in (patterns or [])]
+
+
+def _pick_templates(vendor_hint=""):
+    hint = _to_text(vendor_hint).lower()
+    matched = []
+    for tpl in VENDOR_TEMPLATES:
+        kws = [k.lower() for k in tpl.get("filename_keywords", [])]
+        if kws and any(k in hint for k in kws):
+            matched.append(tpl)
+
+    generic = next((t for t in VENDOR_TEMPLATES if t.get("name") == "generic"), None)
+    if generic:
+        matched.append(generic)
+
+    # 去重保持顺序
+    seen = set()
+    ordered = []
+    for tpl in matched:
+        name = tpl.get("name")
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered.append(tpl)
+    return ordered or VENDOR_TEMPLATES
+
+
+def _header_hit(col_name, keywords):
+    c = _to_text(col_name).lower()
+    if not c:
+        return 0
+    return 1 if any(k.lower() in c for k in keywords or []) else 0
+
+
+def infer_po_item_columns(table_df, sample_df, col_stats, vendor_hint=""):
+    templates = _pick_templates(vendor_hint)
+    candidates = []
+
+    for col in sample_df.columns:
+        vals = sample_df[col].tolist()
+        non_empty_vals = [_to_text(v) for v in vals if _to_text(v)]
+        total = max(len(vals), 1)
+        non_empty_ratio = len(non_empty_vals) / total
+        unique_ratio = (
+            len(set(non_empty_vals)) / len(non_empty_vals) if non_empty_vals else 0
+        )
+        repeat_ratio = 1 - unique_ratio if non_empty_vals else 0
+        avg_len = (
+            sum(len(v) for v in non_empty_vals) / len(non_empty_vals)
+            if non_empty_vals
+            else 0
+        )
+
+        po_score = 0.0
+        item_score = 0.0
+        reasons = []
+
+        # 模板层加分（先行）
+        for tpl in templates:
+            po_rs = _compile_patterns(tpl.get("po_patterns"))
+            item_rs = _compile_patterns(tpl.get("item_patterns"))
+            po_hit_ratio = (
+                sum(1 for v in non_empty_vals if any(r.match(v) for r in po_rs))
+                / len(non_empty_vals)
+                if non_empty_vals
+                else 0
+            )
+            item_hit_ratio = (
+                sum(1 for v in non_empty_vals if any(r.match(v) for r in item_rs))
+                / len(non_empty_vals)
+                if non_empty_vals
+                else 0
+            )
+
+            if po_hit_ratio > 0:
+                po_score += 4.0 * po_hit_ratio
+            if item_hit_ratio > 0:
+                item_score += 4.0 * item_hit_ratio
+
+            if _header_hit(col, tpl.get("po_headers")):
+                po_score += 2.2
+            if _header_hit(col, tpl.get("item_headers")):
+                item_score += 2.2
+
+        # 通用结构分
+        po_score += repeat_ratio * 1.2
+        item_score += repeat_ratio * 0.8
+
+        # 非空率过低时降权
+        po_score += max(0, non_empty_ratio - 0.2)
+        item_score += max(0, non_empty_ratio - 0.2)
+
+        # 长度特征（过短纯数字通常不是PO/物料编码）
+        if avg_len < 4:
+            po_score -= 1.2
+            item_score -= 1.2
+
+        # 明显数值列（数量/金额）降权
+        num_ratio = (
+            col_stats[col]["num_count"] / max(len(sample_df[col]), 1)
+            if col in col_stats
+            else 0
+        )
+        if num_ratio > 0.9 and avg_len <= 6:
+            po_score -= 1.4
+            item_score -= 1.4
+
+        reasons.append(
+            {
+                "non_empty_ratio": round(non_empty_ratio, 3),
+                "repeat_ratio": round(repeat_ratio, 3),
+                "avg_len": round(avg_len, 2),
+                "num_ratio": round(num_ratio, 3),
+            }
+        )
+
+        candidates.append(
+            {
+                "col": col,
+                "po_score": po_score,
+                "item_score": item_score,
+                "reasons": reasons,
+            }
+        )
+
+    if not candidates:
+        return {}, {"confidence": "low", "reason": "no_candidates"}
+
+    po_rank = sorted(candidates, key=lambda x: x["po_score"], reverse=True)
+    item_rank = sorted(candidates, key=lambda x: x["item_score"], reverse=True)
+
+    po_col = po_rank[0]["col"]
+    item_col = item_rank[0]["col"]
+
+    if po_col == item_col:
+        # 冲突时，分数优势小的一方用次优列
+        po_adv = po_rank[0]["po_score"] - (
+            po_rank[1]["po_score"] if len(po_rank) > 1 else -1e9
+        )
+        item_adv = item_rank[0]["item_score"] - (
+            item_rank[1]["item_score"] if len(item_rank) > 1 else -1e9
+        )
+        if po_adv >= item_adv and len(item_rank) > 1:
+            item_col = item_rank[1]["col"]
+        elif len(po_rank) > 1:
+            po_col = po_rank[1]["col"]
+
+    po_gap = po_rank[0]["po_score"] - (
+        po_rank[1]["po_score"] if len(po_rank) > 1 else 0
+    )
+    item_gap = item_rank[0]["item_score"] - (
+        item_rank[1]["item_score"] if len(item_rank) > 1 else 0
+    )
+
+    if po_gap >= 1.5 and item_gap >= 1.5:
+        confidence = "high"
+    elif po_gap >= 0.7 and item_gap >= 0.7:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    suggested = {"po_no": po_col, "item_code": item_col}
+    meta = {
+        "confidence": confidence,
+        "po_top": [
+            {"column": r["col"], "score": round(r["po_score"], 3)} for r in po_rank[:3]
+        ],
+        "item_top": [
+            {"column": r["col"], "score": round(r["item_score"], 3)}
+            for r in item_rank[:3]
+        ],
+        "templates": [t.get("name") for t in templates],
+    }
+    return suggested, meta
+
+
+def detect_vendor_table_and_mapping(raw_df, vendor_hint=""):
+    scan_limit = min(len(raw_df), 200)
+    data_start = None
+
+    for i in range(scan_limit):
+        row = raw_df.iloc[i]
+        po_hits = sum(1 for v in row if _is_po(v))
+        item_hits = sum(1 for v in row if _is_item(v))
+        num_hits = sum(1 for v in row if _to_float(v) is not None)
+        if po_hits >= 1 and item_hits >= 1 and num_hits >= 2:
+            data_start = i
+            break
+
+    if data_start is None:
+        return None, {}
+
+    header_row = max(data_start - 1, 0)
+    header_vals = raw_df.iloc[header_row].tolist()
+
+    table_df = raw_df.iloc[data_start:].reset_index(drop=True).copy()
+    col_names = []
+    used = set()
+    for idx, hv in enumerate(header_vals[: table_df.shape[1]]):
+        name = _to_text(hv) or f"列{idx + 1}"
+        base = name
+        n = 2
+        while name in used:
+            name = f"{base}_{n}"
+            n += 1
+        used.add(name)
+        col_names.append(name)
+
+    if len(col_names) < table_df.shape[1]:
+        for idx in range(len(col_names), table_df.shape[1]):
+            col_names.append(f"列{idx + 1}")
+
+    table_df.columns = [str(c) for c in col_names]
+    table_df = table_df.dropna(how="all", axis=1)
+
+    sample = table_df.head(120)
+    col_stats = {}
+    for col in sample.columns:
+        vals = sample[col].tolist()
+        po_count = sum(1 for v in vals if _is_po(v))
+        item_count = sum(1 for v in vals if _is_item(v))
+        nums = [_to_float(v) for v in vals]
+        nums = [v for v in nums if v is not None]
+        int_ratio = 0
+        mean_val = 0
+        if nums:
+            int_ratio = sum(1 for x in nums if abs(x - round(x)) < 1e-9) / len(nums)
+            mean_val = sum(nums) / len(nums)
+        col_stats[col] = {
+            "po": po_count,
+            "item": item_count,
+            "num_count": len(nums),
+            "int_ratio": int_ratio,
+            "mean": mean_val,
+        }
+
+    suggested = {}
+
+    po_item_suggested, _meta = infer_po_item_columns(
+        table_df, sample, col_stats, vendor_hint
+    )
+    suggested.update(po_item_suggested)
+
+    qty_kw = [c for c in sample.columns if any(k in c for k in ["数量", "數量", "qty"])]
+    price_kw = [
+        c
+        for c in sample.columns
+        if any(k in c for k in ["单价", "單價", "price", "含税单价"])
+    ]
+    amount_kw = [
+        c
+        for c in sample.columns
+        if any(k in c for k in ["金额", "金額", "amount", "价税合计"])
+    ]
+
+    numeric_cols = [c for c in sample.columns if col_stats[c]["num_count"] >= 3]
+
+    if qty_kw:
+        suggested["qty"] = qty_kw[0]
+    if price_kw:
+        suggested["unit_price"] = price_kw[0]
+    if amount_kw:
+        suggested["amount"] = amount_kw[0]
+
+    if "qty" not in suggested:
+        qty_candidates = sorted(
+            numeric_cols,
+            key=lambda c: (col_stats[c]["int_ratio"], col_stats[c]["mean"]),
+            reverse=True,
+        )
+        if qty_candidates:
+            suggested["qty"] = qty_candidates[0]
+
+    if "unit_price" not in suggested:
+        rem = [c for c in numeric_cols if c != suggested.get("qty")]
+        if rem:
+            rem.sort(
+                key=lambda c: col_stats[c]["mean"] if col_stats[c]["mean"] > 0 else 1e18
+            )
+            suggested["unit_price"] = rem[0]
+
+    if "amount" not in suggested and "qty" in suggested and "unit_price" in suggested:
+        rem = [
+            c
+            for c in numeric_cols
+            if c not in {suggested.get("qty"), suggested.get("unit_price")}
+        ]
+        if rem:
+            q = suggested["qty"]
+            p = suggested["unit_price"]
+            best_col = None
+            best_err = None
+            for c in rem:
+                errs = []
+                for _, r in sample[[q, p, c]].dropna().head(60).iterrows():
+                    qv = _to_float(r[q])
+                    pv = _to_float(r[p])
+                    av = _to_float(r[c])
+                    if qv is None or pv is None or av is None:
+                        continue
+                    pred = qv * pv
+                    errs.append(abs(av - pred))
+                if errs:
+                    err = sum(errs) / len(errs)
+                    if best_err is None or err < best_err:
+                        best_err = err
+                        best_col = c
+            if best_col:
+                suggested["amount"] = best_col
+
+    # 依据明细模式识别表尾并裁剪，防止把合计/签字等行纳入对账
+    po_col = suggested.get("po_no")
+    item_col = suggested.get("item_code")
+    qty_col = suggested.get("qty")
+    price_col = suggested.get("unit_price")
+    amount_col = suggested.get("amount")
+
+    if not po_col or not item_col:
+        return table_df, suggested
+
+    detail_indices = []
+    seen_detail = False
+    non_detail_streak = 0
+
+    for idx, row in table_df.iterrows():
+        row_vals = [_to_text(v) for v in row.tolist() if _to_text(v)]
+        has_footer_keyword = any(
+            any(k in cell for k in FOOTER_KEYWORDS) for cell in row_vals
+        )
+
+        if has_footer_keyword and seen_detail:
+            break
+
+        po_ok = _is_po(row.get(po_col))
+        item_ok = _is_item(row.get(item_col))
+
+        numeric_hits = 0
+        for c in [qty_col, price_col, amount_col]:
+            if c and c in table_df.columns and _to_float(row.get(c)) is not None:
+                numeric_hits += 1
+
+        is_detail = po_ok and item_ok and numeric_hits >= 2
+
+        if is_detail:
+            detail_indices.append(idx)
+            seen_detail = True
+            non_detail_streak = 0
+        else:
+            if seen_detail:
+                non_detail_streak += 1
+                if non_detail_streak >= 3:
+                    break
+
+    if detail_indices:
+        table_df = table_df.loc[detail_indices].reset_index(drop=True)
+
+    return table_df, suggested
+
+
+def build_row_refs(rows):
+    return [
+        {
+            "row_no": r.get("row_no"),
+            "qty": r.get("qty"),
+            "unit_price": r.get("unit_price"),
+            "amount": r.get("amount"),
+        }
+        for r in rows
+    ]
+
+
+def split_qty_residual_rows(v_rows, i_rows, price_tolerance=0.0001, qty_tolerance=0):
+    """在数量差异组内做行级配对，只返回未配对残差行用于展示。"""
+    v_used = [False] * len(v_rows)
+    i_used = [False] * len(i_rows)
+
+    # 第一轮：数量+单价同时相同优先配对
+    for vi, vr in enumerate(v_rows):
+        if v_used[vi]:
+            continue
+        vq = vr.get("qty")
+        vp = vr.get("unit_price")
+        for ii, ir in enumerate(i_rows):
+            if i_used[ii]:
+                continue
+            iq = ir.get("qty")
+            ip = ir.get("unit_price")
+            if (
+                abs(float(vq) - float(iq)) <= qty_tolerance
+                and abs(float(vp) - float(ip)) <= price_tolerance
+            ):
+                v_used[vi] = True
+                i_used[ii] = True
+                break
+
+    # 第二轮：仅数量相同也视为配对（数量差异场景下用于剔除无关行）
+    for vi, vr in enumerate(v_rows):
+        if v_used[vi]:
+            continue
+        vq = vr.get("qty")
+        for ii, ir in enumerate(i_rows):
+            if i_used[ii]:
+                continue
+            iq = ir.get("qty")
+            if abs(float(vq) - float(iq)) <= qty_tolerance:
+                v_used[vi] = True
+                i_used[ii] = True
+                break
+
+    v_remain = [r for idx, r in enumerate(v_rows) if not v_used[idx]]
+    i_remain = [r for idx, r in enumerate(i_rows) if not i_used[idx]]
+    return v_remain, i_remain
+
+
+def _pair_rows(v_rows, i_rows, match_fn):
+    """按给定规则做一对一贪心配对。"""
+    v_used = [False] * len(v_rows)
+    i_used = [False] * len(i_rows)
+    pairs = []
+
+    for vi, vr in enumerate(v_rows):
+        if v_used[vi]:
+            continue
+        for ii, ir in enumerate(i_rows):
+            if i_used[ii]:
+                continue
+            if match_fn(vr, ir):
+                v_used[vi] = True
+                i_used[ii] = True
+                pairs.append((vr, ir))
+                break
+
+    v_remain = [r for idx, r in enumerate(v_rows) if not v_used[idx]]
+    i_remain = [r for idx, r in enumerate(i_rows) if not i_used[idx]]
+    return pairs, v_remain, i_remain
+
+
+# 默认列映射配置
+DEFAULT_VENDOR_MAPPING = {
+    "po_no": "订单号码",
+    "item_code": "物料编码",
+    "item_name": "品名",
+    "qty": "数量",
+    "unit_price": "单价",
+    "amount": "金额",
+}
+
+DEFAULT_INTERNAL_MAPPING = {
+    "item_code": "物料编码",
+    "item_name": "物料名称",
+    "spec": "规格型号",
+    "qty": "实收数量",
+    "unit_price": "含税单价",
+    "amount": "价税合计",
+}
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/task/create", methods=["POST"])
+def create_task():
+    try:
+        _cleanup_uploads()
+        task = ReconcileTask(id=str(uuid4()), status="created")
+        db.session.add(task)
+        db.session.commit()
+        return jsonify({"success": True, "task_id": task.id, "status": task.status})
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("创建任务失败")
+        return error_response("创建任务失败", code="TASK_CREATE_FAILED", status=500)
+
+
+@app.route("/api/task/<task_id>", methods=["GET"])
+def get_task_detail(task_id):
+    task = _get_task_or_error(task_id)
+    if task is None:
+        return error_response("任务不存在", code="TASK_NOT_FOUND", status=404)
+
+    uploads = {}
+    for record in task.uploads:
+        uploads[record.file_type] = {
+            "filename": record.file_name,
+            "row_count": record.row_count,
+            "columns": _json_loads(record.columns_json, []),
+            "preview": _json_loads(record.preview_json, []),
+            "extra": _json_loads(record.extra_json, {}),
+            "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+        }
+
+    result = _json_loads(task.result.result_json, {}) if task.result else None
+    summary = _json_loads(task.result.summary_json, {}) if task.result else None
+
+    return jsonify(
+        {
+            "success": True,
+            "task": {
+                "task_id": task.id,
+                "status": task.status,
+                "error_message": task.error_message,
+                "created_at": task.created_at.isoformat() if task.created_at else None,
+                "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+                "uploads": uploads,
+                "summary": summary,
+                "result": result,
+            },
+        }
+    )
+
+
+@app.route("/api/tasks/recent", methods=["GET"])
+def get_recent_tasks():
+    try:
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    tasks = (
+        ReconcileTask.query.order_by(ReconcileTask.created_at.desc()).limit(limit).all()
+    )
+    payload = []
+    for task in tasks:
+        summary = _json_loads(task.result.summary_json, {}) if task.result else {}
+        payload.append(
+            {
+                "task_id": task.id,
+                "status": task.status,
+                "created_at": task.created_at.isoformat() if task.created_at else None,
+                "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+                "summary": summary,
+            }
+        )
+    return jsonify({"success": True, "tasks": payload})
+
+
+@app.route("/api/upload/vendor", methods=["POST"])
+def upload_vendor_file():
+    """上传供应商对账单"""
+    try:
+        _cleanup_uploads()
+        if "file" not in request.files:
+            return error_response("没有选择文件", code="FILE_MISSING", status=400)
+
+        file = request.files["file"]
+        if file.filename == "":
+            return error_response("文件名为空", code="FILE_EMPTY_NAME", status=400)
+
+        if not _allowed_excel(file.filename):
+            return error_response(
+                "请上传Excel文件(.xlsx或.xls)",
+                code="INVALID_FILE_TYPE",
+                status=400,
+            )
+
+        filename = secure_filename(_new_upload_filename("vendor"))
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        file.save(filepath)
+
+        df, suggested = _read_vendor_data(filepath, file.filename)
+        preview = _build_preview(df)
+        columns = df.columns.tolist()
+        task_id = _to_text(request.form.get("task_id"))
+
+        # 兼容旧流程：不传 task_id 仍写入内存态
+        if not task_id:
+            current_task["vendor_file"] = filepath
+            current_task["vendor_data"] = df
+        else:
+            task = _get_task_or_error(task_id)
+            if task is None:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                return error_response("任务不存在", code="TASK_NOT_FOUND", status=404)
+            _upsert_upload_record(
+                task,
+                file_type="vendor",
+                original_name=file.filename,
+                filepath=filepath,
+                df=df,
+                preview=preview,
+                extra={"suggested_mapping": suggested},
+            )
+            db.session.commit()
+
+        return jsonify(
+            {
+                "success": True,
+                "task_id": task_id or None,
+                "filename": file.filename,
+                "row_count": len(df),
+                "columns": columns,
+                "preview": preview,
+                "suggested_mapping": suggested,
+            }
+        )
+
+    except ValidationError as e:
+        if task_id:
+            task = _get_task_or_error(task_id)
+            if task is not None:
+                task.status = "failed"
+                task.error_message = e.message
+                db.session.commit()
+        return error_response(
+            e.message, code=e.code, status=e.status, details=e.details
+        )
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("上传供应商文件失败")
+        return error_response("上传供应商文件失败", code="UPLOAD_FAILED", status=500)
+
+
+@app.route("/api/upload/internal", methods=["POST"])
+def upload_internal_file():
+    """上传系统入库单"""
+    try:
+        _cleanup_uploads()
+        if "file" not in request.files:
+            return error_response("没有选择文件", code="FILE_MISSING", status=400)
+
+        file = request.files["file"]
+        if file.filename == "":
+            return error_response("文件名为空", code="FILE_EMPTY_NAME", status=400)
+
+        if not _allowed_excel(file.filename):
+            return error_response(
+                "请上传Excel文件(.xlsx或.xls)",
+                code="INVALID_FILE_TYPE",
+                status=400,
+            )
+
+        filename = secure_filename(_new_upload_filename("internal"))
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        file.save(filepath)
+
+        df, footer_meta = _read_internal_data(filepath)
+        preview = _build_preview(df)
+        columns = df.columns.tolist()
+        task_id = _to_text(request.form.get("task_id"))
+
+        if not task_id:
+            current_task["internal_file"] = filepath
+            current_task["internal_data"] = df
+        else:
+            task = _get_task_or_error(task_id)
+            if task is None:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                return error_response("任务不存在", code="TASK_NOT_FOUND", status=404)
+            _upsert_upload_record(
+                task,
+                file_type="internal",
+                original_name=file.filename,
+                filepath=filepath,
+                df=df,
+                preview=preview,
+                extra={"footer_detection": footer_meta},
+            )
+            db.session.commit()
+
+        return jsonify(
+            {
+                "success": True,
+                "task_id": task_id or None,
+                "filename": file.filename,
+                "row_count": len(df),
+                "columns": columns,
+                "preview": preview,
+                "footer_detection": footer_meta,
+            }
+        )
+
+    except ValidationError as e:
+        return error_response(
+            e.message, code=e.code, status=e.status, details=e.details
+        )
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("上传系统入库单失败")
+        return error_response("上传系统入库单失败", code="UPLOAD_FAILED", status=500)
+
+
+@app.route("/api/reconcile", methods=["POST"])
+def reconcile():
+    """执行对账"""
+    task_id = ""
+    try:
+        data = request.get_json(silent=True) or {}
+        task_id = _to_text(data.get("task_id"))
+
+        if task_id:
+            task = _get_task_or_error(task_id)
+            if task is None:
+                return error_response("任务不存在", code="TASK_NOT_FOUND", status=404)
+
+            vendor_upload = UploadRecord.query.filter_by(
+                task_id=task_id, file_type="vendor"
+            ).first()
+            internal_upload = UploadRecord.query.filter_by(
+                task_id=task_id, file_type="internal"
+            ).first()
+            if vendor_upload is None or internal_upload is None:
+                return error_response(
+                    "请先上传两个文件",
+                    code="MISSING_UPLOADS",
+                    status=400,
+                )
+            vendor_df, _ = _read_vendor_data(vendor_upload.saved_path, vendor_upload.file_name)
+            internal_df, _ = _read_internal_data(internal_upload.saved_path)
+        else:
+            if current_task["vendor_data"] is None or current_task["internal_data"] is None:
+                return error_response(
+                    "请先上传两个文件",
+                    code="MISSING_UPLOADS",
+                    status=400,
+                )
+            vendor_df = current_task["vendor_data"]
+            internal_df = current_task["internal_data"]
+
+        # 获取列映射配置
+        vendor_mapping = data.get("vendor_mapping", DEFAULT_VENDOR_MAPPING)
+        internal_mapping = data.get("internal_mapping", DEFAULT_INTERNAL_MAPPING)
+        _ensure_required_mapping(
+            vendor_mapping,
+            ["po_no", "item_code", "qty", "unit_price", "amount"],
+            vendor_df.columns.tolist(),
+            "供应商",
+        )
+        _ensure_required_mapping(
+            internal_mapping,
+            ["po_no", "item_code", "qty", "unit_price", "amount"],
+            internal_df.columns.tolist(),
+            "系统入库单",
+        )
+
+        # 容差设置
+        try:
+            price_tolerance = float(data.get("price_tolerance", 0.0001))
+            qty_tolerance = float(data.get("qty_tolerance", 0))
+            amount_tolerance = float(data.get("amount_tolerance", 0.01))
+        except (TypeError, ValueError):
+            raise ValidationError(
+                "容差参数格式错误",
+                code="INVALID_TOLERANCE",
+                status=400,
+            )
+
+        # 执行对账
+        result = perform_reconciliation(
+            vendor_df,
+            internal_df,
+            vendor_mapping,
+            internal_mapping,
+            price_tolerance,
+            qty_tolerance,
+            amount_tolerance,
+        )
+
+        if task_id:
+            task.status = "reconciled"
+            task.error_message = None
+            row = ReconcileResult.query.filter_by(task_id=task_id).first()
+            if row is None:
+                row = ReconcileResult(task_id=task_id)
+                db.session.add(row)
+            row.summary_json = _json_dumps(result.get("summary", {}))
+            row.result_json = _json_dumps(result)
+            row.mapping_json = _json_dumps(
+                {"vendor_mapping": vendor_mapping, "internal_mapping": internal_mapping}
+            )
+            row.tolerance_json = _json_dumps(
+                {
+                    "price_tolerance": price_tolerance,
+                    "qty_tolerance": qty_tolerance,
+                    "amount_tolerance": amount_tolerance,
+                }
+            )
+            db.session.commit()
+        else:
+            current_task["result"] = result
+
+        return jsonify(
+            {
+                "success": True,
+                "task_id": task_id or None,
+                "result": result,
+            }
+        )
+
+    except ValidationError as e:
+        if task_id:
+            task = _get_task_or_error(task_id)
+            if task is not None:
+                try:
+                    task.status = "failed"
+                    task.error_message = e.message
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+        return error_response(
+            e.message, code=e.code, status=e.status, details=e.details
+        )
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("执行对账失败")
+        if task_id:
+            task = _get_task_or_error(task_id)
+            if task is not None:
+                try:
+                    task.status = "failed"
+                    task.error_message = "执行对账失败"
+                    db.session.commit()
+                except Exception:
+                    db.session.rollback()
+        return error_response("执行对账失败", code="RECONCILE_FAILED", status=500)
+
+
+def perform_reconciliation(
+    vendor_df,
+    internal_df,
+    vendor_mapping,
+    internal_mapping,
+    price_tolerance=0.0001,
+    qty_tolerance=0,
+    amount_tolerance=0.01,
+):
+    """
+    执行对账核心逻辑
+    差异分类：差异项 > 数量差异 > 单价差异 > 金额差异
+    """
+    # 标准化供应商数据
+    vendor_std = standardize_vendor_data(vendor_df, vendor_mapping)
+
+    # 标准化内部数据
+    internal_std = standardize_internal_data(internal_df, internal_mapping)
+
+    # 按PO号+物料编码分组
+    vendor_std["po_item_key"] = (
+        vendor_std["po_no"].astype(str)
+        + "|"
+        + vendor_std["item_code_clean"].astype(str)
+    ).str.strip()
+    internal_std["po_item_key"] = (
+        internal_std["po_no"].astype(str) + "|" + internal_std["item_code"].astype(str)
+    ).str.strip()
+
+    # 构建PO+物料编码的映射
+    vendor_grouped = (
+        vendor_std.groupby("po_item_key")
+        .agg(
+            {
+                "qty": "sum",
+                "unit_price": "first",
+                "amount": "sum",
+                "po_no": "first",
+                "item_code_clean": "first",
+            }
+        )
+        .reset_index()
+    )
+
+    internal_grouped = (
+        internal_std.groupby("po_item_key")
+        .agg(
+            {
+                "qty": "sum",
+                "unit_price": "first",
+                "amount": "sum",
+                "po_no": "first",
+                "item_code": "first",
+            }
+        )
+        .reset_index()
+    )
+
+    # 获取所有唯一的PO+物料编码
+    all_keys = set(vendor_grouped["po_item_key"]) | set(internal_grouped["po_item_key"])
+
+    # 分类结果
+    matched_list = []  # 分组级完全匹配
+    matched_pairs = []  # 行级完全匹配（真实配对）
+    matched_groups = []  # 仅用于前端展示分组视图
+    diff_items = []  # 差异项：一方完全不存在
+    diff_qty = []  # 数量差异
+    diff_price = []  # 单价差异
+    diff_amount = []  # 金额差异
+
+    # 创建内部数据的索引映射
+    internal_key_to_rows = {}
+    for i_idx, i_row in internal_std.iterrows():
+        key = i_row["po_item_key"]
+        if key not in internal_key_to_rows:
+            internal_key_to_rows[key] = []
+        internal_key_to_rows[key].append(i_row.to_dict())
+
+    # 创建供应商数据的索引映射
+    vendor_key_to_rows = {}
+    for v_idx, v_row in vendor_std.iterrows():
+        key = v_row["po_item_key"]
+        if key not in vendor_key_to_rows:
+            vendor_key_to_rows[key] = []
+        vendor_key_to_rows[key].append(v_row.to_dict())
+
+    for key in all_keys:
+        v_rows = vendor_key_to_rows.get(key, [])
+        i_rows = internal_key_to_rows.get(key, [])
+        vendor_refs = build_row_refs(v_rows)
+        internal_refs = build_row_refs(i_rows)
+
+        v_sum_qty = sum(r["qty"] for r in v_rows) if v_rows else 0
+        i_sum_qty = sum(r["qty"] for r in i_rows) if i_rows else 0
+
+        v_unit_price = v_rows[0]["unit_price"] if v_rows else 0
+        i_unit_price = i_rows[0]["unit_price"] if i_rows else 0
+
+        v_sum_amount = sum(r["amount"] for r in v_rows) if v_rows else 0
+        i_sum_amount = sum(r["amount"] for r in i_rows) if i_rows else 0
+
+        # 1. 差异项：一方完全没有这个PO+物料编码
+        if not v_rows or not i_rows:
+            diff_items.append(
+                {
+                    "po_no": v_rows[0]["po_no"]
+                    if v_rows
+                    else (i_rows[0]["po_no"] if i_rows else ""),
+                    "item_code": v_rows[0]["item_code_clean"]
+                    if v_rows
+                    else (i_rows[0]["item_code"] if i_rows else ""),
+                    "vendor_qty": v_sum_qty,
+                    "internal_qty": i_sum_qty,
+                    "vendor_price": v_unit_price,
+                    "internal_price": i_unit_price,
+                    "vendor_amount": v_sum_amount,
+                    "internal_amount": i_sum_amount,
+                    "vendor_rows": v_rows,
+                    "internal_rows": i_rows,
+                    "vendor_refs": vendor_refs,
+                    "internal_refs": internal_refs,
+                    "diff_type": "差异项",
+                }
+            )
+            continue
+
+        # 行级严格匹配：数量+单价+金额均在容差内
+        strict_pairs, v_unmatched, i_unmatched = _pair_rows(
+            v_rows,
+            i_rows,
+            lambda vr, ir: (
+                abs(float(vr.get("qty", 0)) - float(ir.get("qty", 0))) <= qty_tolerance
+                and abs(float(vr.get("unit_price", 0)) - float(ir.get("unit_price", 0)))
+                <= price_tolerance
+                and abs(float(vr.get("amount", 0)) - float(ir.get("amount", 0)))
+                <= amount_tolerance
+            ),
+        )
+
+        # 完全匹配：组内每一行都能完成严格配对
+        if not v_unmatched and not i_unmatched:
+            for vr, ir in strict_pairs:
+                matched_pairs.append(
+                    {
+                        "po_no": vr.get("po_no"),
+                        "item_code": vr.get("item_code_clean"),
+                        "vendor_qty": vr.get("qty"),
+                        "internal_qty": ir.get("qty"),
+                        "vendor_price": vr.get("unit_price"),
+                        "internal_price": ir.get("unit_price"),
+                        "vendor_amount": vr.get("amount"),
+                        "internal_amount": ir.get("amount"),
+                        "vendor_rows": [vr],
+                        "internal_rows": [ir],
+                        "vendor_refs": build_row_refs([vr]),
+                        "internal_refs": build_row_refs([ir]),
+                        "diff_type": "完全匹配",
+                    }
+                )
+
+            group_row = {
+                "po_no": v_rows[0]["po_no"],
+                "item_code": v_rows[0]["item_code_clean"],
+                "vendor_qty": v_sum_qty,
+                "internal_qty": i_sum_qty,
+                "vendor_price": v_unit_price,
+                "internal_price": i_unit_price,
+                "vendor_amount": v_sum_amount,
+                "internal_amount": i_sum_amount,
+                "vendor_rows": v_rows,
+                "internal_rows": i_rows,
+                "vendor_refs": vendor_refs,
+                "internal_refs": internal_refs,
+                "diff_type": "完全匹配",
+            }
+            matched_list.append(group_row)
+            matched_groups.append(group_row)
+            continue
+
+        # 2. 数量差异：PO+物料编码匹配上了，但数量不一致
+        if abs(v_sum_qty - i_sum_qty) > qty_tolerance:
+            v_remain, i_remain = split_qty_residual_rows(
+                v_rows, i_rows, price_tolerance, qty_tolerance
+            )
+            diff_qty.append(
+                {
+                    "po_no": v_rows[0]["po_no"],
+                    "item_code": v_rows[0]["item_code_clean"],
+                    "vendor_qty": v_sum_qty,
+                    "internal_qty": i_sum_qty,
+                    "vendor_price": v_unit_price,
+                    "internal_price": i_unit_price,
+                    "vendor_amount": v_sum_amount,
+                    "internal_amount": i_sum_amount,
+                    "vendor_rows": v_rows,
+                    "internal_rows": i_rows,
+                    "vendor_refs": build_row_refs(v_remain),
+                    "internal_refs": build_row_refs(i_remain),
+                    "diff_type": "数量差异",
+                }
+            )
+            continue
+
+        # 数量总和一致时，先看是否可按 数量+单价 配对（只剩金额差）
+        _, qp_v_remain, qp_i_remain = _pair_rows(
+            v_rows,
+            i_rows,
+            lambda vr, ir: (
+                abs(float(vr.get("qty", 0)) - float(ir.get("qty", 0))) <= qty_tolerance
+                and abs(float(vr.get("unit_price", 0)) - float(ir.get("unit_price", 0)))
+                <= price_tolerance
+            ),
+        )
+
+        # 3. 单价差异：数量一致但无法按 数量+单价 配对，说明单价结构不一致
+        if qp_v_remain or qp_i_remain:
+            diff_price.append(
+                {
+                    "po_no": v_rows[0]["po_no"],
+                    "item_code": v_rows[0]["item_code_clean"],
+                    "vendor_qty": v_sum_qty,
+                    "internal_qty": i_sum_qty,
+                    "vendor_price": v_unit_price,
+                    "internal_price": i_unit_price,
+                    "vendor_amount": v_sum_amount,
+                    "internal_amount": i_sum_amount,
+                    "vendor_rows": v_rows,
+                    "internal_rows": i_rows,
+                    "vendor_refs": vendor_refs,
+                    "internal_refs": internal_refs,
+                    "diff_type": "单价差异",
+                }
+            )
+            continue
+
+        # 4. 金额差异：可按 数量+单价 配对，但金额不一致
+        if abs(v_sum_amount - i_sum_amount) > amount_tolerance:
+            diff_amount.append(
+                {
+                    "po_no": v_rows[0]["po_no"],
+                    "item_code": v_rows[0]["item_code_clean"],
+                    "vendor_qty": v_sum_qty,
+                    "internal_qty": i_sum_qty,
+                    "vendor_price": v_unit_price,
+                    "internal_price": i_unit_price,
+                    "vendor_amount": v_sum_amount,
+                    "internal_amount": i_sum_amount,
+                    "vendor_rows": v_rows,
+                    "internal_rows": i_rows,
+                    "vendor_refs": vendor_refs,
+                    "internal_refs": internal_refs,
+                    "diff_type": "金额差异",
+                }
+            )
+            continue
+
+        # 兜底：理论上很少走到，归入金额差异，避免误判为完全匹配
+        diff_amount.append(
+            {
+                "po_no": v_rows[0]["po_no"],
+                "item_code": v_rows[0]["item_code_clean"],
+                "vendor_qty": v_sum_qty,
+                "internal_qty": i_sum_qty,
+                "vendor_price": v_unit_price,
+                "internal_price": i_unit_price,
+                "vendor_amount": v_sum_amount,
+                "internal_amount": i_sum_amount,
+                "vendor_rows": v_rows,
+                "internal_rows": i_rows,
+                "vendor_refs": vendor_refs,
+                "internal_refs": internal_refs,
+                "diff_type": "金额差异",
+            }
+        )
+
+    # 计算统计信息
+    total_vendor_amount = vendor_std["amount"].sum() if len(vendor_std) > 0 else 0
+    total_internal_amount = internal_std["amount"].sum() if len(internal_std) > 0 else 0
+    matched_amount = sum(m["vendor_amount"] for m in matched_pairs)
+    matched_display_count = len(matched_pairs)
+    diff_items_display_count = sum(
+        max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
+        for m in diff_items
+    )
+    diff_qty_display_count = sum(
+        max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
+        for m in diff_qty
+    )
+    diff_price_display_count = sum(
+        max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
+        for m in diff_price
+    )
+    diff_amount_display_count = sum(
+        max(len(m.get("vendor_refs", [])), len(m.get("internal_refs", [])), 1)
+        for m in diff_amount
+    )
+
+    matched_vendor_lines = len(matched_pairs)
+    matched_internal_lines = len(matched_pairs)
+    diff_items_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_items)
+    diff_items_internal_lines = sum(len(m.get("internal_rows", [])) for m in diff_items)
+    diff_qty_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_qty)
+    diff_qty_internal_lines = sum(len(m.get("internal_rows", [])) for m in diff_qty)
+    diff_price_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_price)
+    diff_price_internal_lines = sum(len(m.get("internal_rows", [])) for m in diff_price)
+    diff_amount_vendor_lines = sum(len(m.get("vendor_rows", [])) for m in diff_amount)
+    diff_amount_internal_lines = sum(
+        len(m.get("internal_rows", [])) for m in diff_amount
+    )
+
+    result = {
+        "summary": {
+            "vendor_total_rows": len(vendor_std),
+            "internal_total_rows": len(internal_std),
+            "vendor_total_amount": round(total_vendor_amount, 2),
+            "internal_total_amount": round(total_internal_amount, 2),
+            "matched_vendor_lines": matched_vendor_lines,
+            "matched_internal_lines": matched_internal_lines,
+            "diff_items_vendor_lines": diff_items_vendor_lines,
+            "diff_items_internal_lines": diff_items_internal_lines,
+            "diff_qty_vendor_lines": diff_qty_vendor_lines,
+            "diff_qty_internal_lines": diff_qty_internal_lines,
+            "diff_price_vendor_lines": diff_price_vendor_lines,
+            "diff_price_internal_lines": diff_price_internal_lines,
+            "diff_amount_vendor_lines": diff_amount_vendor_lines,
+            "diff_amount_internal_lines": diff_amount_internal_lines,
+            "matched_count": len(matched_list),
+            "matched_display_count": matched_display_count,
+            "diff_items_count": len(diff_items),
+            "diff_qty_count": len(diff_qty),
+            "diff_price_count": len(diff_price),
+            "diff_amount_count": len(diff_amount),
+            "diff_items_display_count": diff_items_display_count,
+            "diff_qty_display_count": diff_qty_display_count,
+            "diff_price_display_count": diff_price_display_count,
+            "diff_amount_display_count": diff_amount_display_count,
+            "matched_amount": round(matched_amount, 2),
+            "diff_amount": round(total_vendor_amount - total_internal_amount, 2),
+        },
+        "matched_list": matched_list,
+        "matched_pairs": matched_pairs,
+        "matched_groups": matched_groups,
+        "diff_items": diff_items,
+        "diff_qty": diff_qty,
+        "diff_price": diff_price,
+        "diff_amount": diff_amount,
+    }
+
+    return clean_dict(result)
+
+
+def standardize_vendor_data(df, mapping):
+    """标准化供应商数据"""
+    std_data = pd.DataFrame()
+    std_data["row_no"] = df.index + 1
+
+    # 列名映射
+    column_map = {
+        "po_no": mapping.get("po_no", "订单号码"),
+        "item_code_raw": mapping.get("item_code", "物料编码"),
+        "item_name": mapping.get("item_name", "品名"),
+        "qty": mapping.get("qty", "数量"),
+        "unit_price": mapping.get("unit_price", "单价"),
+        "amount": mapping.get("amount", "金额"),
+    }
+
+    missing_columns = [
+        {"field": field, "column": col}
+        for field, col in column_map.items()
+        if field in ["po_no", "item_code_raw", "qty", "unit_price", "amount"]
+        and _to_text(col) not in df.columns
+    ]
+    if missing_columns:
+        raise ValidationError(
+            "供应商映射列不存在",
+            code="MAPPING_COLUMN_NOT_FOUND",
+            details={"side": "供应商", "missing_columns": missing_columns},
+            status=400,
+        )
+
+    for std_col, orig_col in column_map.items():
+        std_data[std_col] = df[orig_col] if _to_text(orig_col) in df.columns else None
+
+    # 数据清洗
+    qty_series, qty_errors = _parse_qty_strict(
+        std_data["qty"], std_data["row_no"], side="vendor"
+    )
+    if qty_errors:
+        raise ValidationError(
+            "供应商数量字段存在非法值",
+            code="INVALID_QTY",
+            details={"errors": qty_errors},
+            status=400,
+        )
+    std_data["qty"] = qty_series.astype(int)
+
+    # 单价标准化为4位小数
+    std_data["unit_price"] = pd.to_numeric(
+        std_data["unit_price"], errors="coerce"
+    ).fillna(0)
+    std_data["unit_price"] = std_data["unit_price"].round(4)
+
+    # 金额计算
+    std_data["amount"] = pd.to_numeric(std_data["amount"], errors="coerce").fillna(0)
+
+    # 物料编码清洗
+    std_data["item_code_clean"] = std_data["item_code_raw"].astype(str).str.strip()
+
+    return std_data
+
+
+def standardize_internal_data(df, mapping):
+    """标准化内部数据"""
+    std_data = pd.DataFrame()
+    std_data["row_no"] = df.index + 1
+
+    # 列名映射
+    column_map = {
+        "po_no": mapping.get("po_no", "订单单号"),
+        "item_code": mapping.get("item_code", "物料编码"),
+        "item_name": mapping.get("item_name", "物料名称"),
+        "spec": mapping.get("spec", "规格型号"),
+        "qty": mapping.get("qty", "实收数量"),
+        "unit_price": mapping.get("unit_price", "含税单价"),
+        "amount": mapping.get("amount", "价税合计"),
+    }
+
+    missing_columns = [
+        {"field": field, "column": col}
+        for field, col in column_map.items()
+        if field in ["po_no", "item_code", "qty", "unit_price", "amount"]
+        and _to_text(col) not in df.columns
+    ]
+    if missing_columns:
+        raise ValidationError(
+            "系统入库单映射列不存在",
+            code="MAPPING_COLUMN_NOT_FOUND",
+            details={"side": "系统入库单", "missing_columns": missing_columns},
+            status=400,
+        )
+
+    for std_col, orig_col in column_map.items():
+        std_data[std_col] = df[orig_col] if _to_text(orig_col) in df.columns else None
+
+    # 数据清洗
+    qty_series, qty_errors = _parse_qty_strict(
+        std_data["qty"], std_data["row_no"], side="internal"
+    )
+    if qty_errors:
+        raise ValidationError(
+            "系统入库单数量字段存在非法值",
+            code="INVALID_QTY",
+            details={"errors": qty_errors},
+            status=400,
+        )
+    std_data["qty"] = qty_series.astype(int)
+
+    std_data["unit_price"] = (
+        pd.to_numeric(std_data["unit_price"], errors="coerce").fillna(0).round(4)
+    )
+    std_data["amount"] = pd.to_numeric(std_data["amount"], errors="coerce").fillna(0)
+    std_data["item_code"] = std_data["item_code"].astype(str).str.strip()
+
+    return std_data
+
+
+@app.route("/api/export", methods=["POST"])
+def export_results():
+    """导出对账结果"""
+    try:
+        data = request.get_json(silent=True) or {}
+        task_id = _to_text(data.get("task_id"))
+
+        if task_id:
+            task = _get_task_or_error(task_id)
+            if task is None:
+                return error_response("任务不存在", code="TASK_NOT_FOUND", status=404)
+            if task.result is None:
+                return error_response("没有可导出的结果", code="RESULT_NOT_FOUND", status=404)
+            result = _json_loads(task.result.result_json, {})
+        else:
+            if current_task["result"] is None:
+                return error_response(
+                    "没有可导出的结果", code="RESULT_NOT_FOUND", status=404
+                )
+            result = current_task["result"]
+
+        # 创建Excel文件
+        output = io.BytesIO()
+
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            # 汇总表
+            summary_df = pd.DataFrame([result["summary"]])
+            summary_df.to_excel(writer, sheet_name="汇总", index=False)
+
+            # 完全匹配明细
+            if result.get("matched_list"):
+                matched_df = pd.DataFrame(
+                    [
+                        {
+                            "PO号": m["po_no"],
+                            "物料编码": m["item_code"],
+                            "供应商数量": m["vendor_qty"],
+                            "系统数量": m["internal_qty"],
+                            "供应商单价": m["vendor_price"],
+                            "系统单价": m["internal_price"],
+                            "供应商金额": m["vendor_amount"],
+                            "系统金额": m["internal_amount"],
+                        }
+                        for m in result["matched_list"]
+                    ]
+                )
+                matched_df.to_excel(writer, sheet_name="完全匹配", index=False)
+
+            # 差异项
+            if result.get("diff_items"):
+                diff_items_df = pd.DataFrame(
+                    [
+                        {
+                            "差异类型": "差异项",
+                            "PO号": m["po_no"],
+                            "物料编码": m["item_code"],
+                            "供应商数量": m["vendor_qty"],
+                            "系统数量": m["internal_qty"],
+                            "供应商单价": m["vendor_price"],
+                            "系统单价": m["internal_price"],
+                            "供应商金额": m["vendor_amount"],
+                            "系统金额": m["internal_amount"],
+                        }
+                        for m in result["diff_items"]
+                    ]
+                )
+                diff_items_df.to_excel(writer, sheet_name="差异项", index=False)
+
+            # 数量差异
+            if result.get("diff_qty"):
+                diff_qty_df = pd.DataFrame(
+                    [
+                        {
+                            "差异类型": "数量差异",
+                            "PO号": m["po_no"],
+                            "物料编码": m["item_code"],
+                            "供应商数量": m["vendor_qty"],
+                            "系统数量": m["internal_qty"],
+                            "供应商单价": m["vendor_price"],
+                            "系统单价": m["internal_price"],
+                            "供应商金额": m["vendor_amount"],
+                            "系统金额": m["internal_amount"],
+                        }
+                        for m in result["diff_qty"]
+                    ]
+                )
+                diff_qty_df.to_excel(writer, sheet_name="数量差异", index=False)
+
+            # 单价差异
+            if result.get("diff_price"):
+                diff_price_df = pd.DataFrame(
+                    [
+                        {
+                            "差异类型": "单价差异",
+                            "PO号": m["po_no"],
+                            "物料编码": m["item_code"],
+                            "供应商数量": m["vendor_qty"],
+                            "系统数量": m["internal_qty"],
+                            "供应商单价": m["vendor_price"],
+                            "系统单价": m["internal_price"],
+                            "供应商金额": m["vendor_amount"],
+                            "系统金额": m["internal_amount"],
+                        }
+                        for m in result["diff_price"]
+                    ]
+                )
+                diff_price_df.to_excel(writer, sheet_name="单价差异", index=False)
+
+            # 金额差异
+            if result.get("diff_amount"):
+                diff_amount_df = pd.DataFrame(
+                    [
+                        {
+                            "差异类型": "金额差异",
+                            "PO号": m["po_no"],
+                            "物料编码": m["item_code"],
+                            "供应商数量": m["vendor_qty"],
+                            "系统数量": m["internal_qty"],
+                            "供应商单价": m["vendor_price"],
+                            "系统单价": m["internal_price"],
+                            "供应商金额": m["vendor_amount"],
+                            "系统金额": m["internal_amount"],
+                        }
+                        for m in result["diff_amount"]
+                    ]
+                )
+                diff_amount_df.to_excel(writer, sheet_name="金额差异", index=False)
+
+        output.seek(0)
+
+        return send_file(
+            output,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"对账结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        )
+
+    except Exception:
+        app.logger.exception("导出结果失败")
+        return error_response("导出结果失败", code="EXPORT_FAILED", status=500)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
